@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..models_db import User, AdminConfig
-from ..auth import get_current_admin, hash_password
+from ..auth import get_current_admin, hash_password, get_current_user
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -38,7 +38,7 @@ def _apply_config_to_env(cfg: AdminConfig):
     if cfg.ezplm_api_key:
         os.environ["EZPLM_API_KEY"] = cfg.ezplm_api_key
     if cfg.verifier_model:
-        os.environ["LLM_MODEL_VERIFIER"] = cfg.verifier_model
+        os.environ["LLM_VERIFIER_MODEL"] = cfg.verifier_model
     if cfg.verifier_api_key:
         os.environ["LLM_VERIFIER_API_KEY"] = cfg.verifier_api_key
     if cfg.verifier_base_url:
@@ -54,6 +54,41 @@ class ConfigBody(BaseModel):
     verifier_model: Optional[str] = None
     verifier_api_key: Optional[str] = None
     verifier_base_url: Optional[str] = None
+
+
+class TestVerifierBody(BaseModel):
+    verifier_model: str
+    verifier_api_key: Optional[str] = None
+    verifier_base_url: Optional[str] = None
+
+
+@router.post("/config/test-verifier")
+def test_verifier_connection(body: TestVerifierBody, admin=Depends(get_current_admin)):
+    """测试验证模型连通性，保存前必须通过测试。"""
+    if not body.verifier_model.strip():
+        raise HTTPException(400, "验证模型名称不能为空")
+    try:
+        from ..llm_client import call_openai_chat
+        result = call_openai_chat(
+            messages=[{"role": "user", "content": "测试连接，请仅回复：OK"}],
+            temperature=0.0,
+            model_override=body.verifier_model.strip(),
+            api_key_override=body.verifier_api_key.strip() if body.verifier_api_key else None,
+            base_url_override=body.verifier_base_url.strip().rstrip("/") if body.verifier_base_url else None,
+            thinking_depth="off",
+        )
+        content = (result.get("content") or "").strip()[:120]
+        return {"ok": True, "response": content}
+    except Exception as e:
+        raise HTTPException(400, f"连接失败: {str(e)[:200]}")
+
+
+@router.get("/verifier-status")
+def verifier_status(db: Session = Depends(get_db), user=Depends(get_current_user)):
+    """任意已登录用户可查询：验证模型是否已由管理员配置。"""
+    cfg = db.query(AdminConfig).first()
+    configured = bool(cfg and cfg.verifier_model and cfg.verifier_model.strip())
+    return {"configured": configured}
 
 
 @router.get("/setup-required")

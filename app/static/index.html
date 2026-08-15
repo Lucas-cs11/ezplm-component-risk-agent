@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>eZmanbo — 智能元器件选型</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,'Segoe UI',sans-serif;background:#f5f6f8;color:#1a1a2e;height:100vh;display:flex;flex-direction:column}
+header{background:#1a1a2e;color:#fff;padding:12px 20px;display:flex;align-items:center;gap:12px;flex-shrink:0}
+header h1{font-size:18px;font-weight:600}
+header .badge{font-size:10px;background:#e94560;color:#fff;padding:2px 8px;border-radius:10px}
+#status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-left:auto}
+#status-dot.online{background:#198754}
+#status-dot.offline{background:#dc3545}
+#status-dot.checking{background:#ffc107;animation:pulse 1s infinite}
+@keyframes pulse{50%{opacity:.4}}
+.container{display:flex;flex:1;overflow:hidden}
+.sidebar{width:260px;background:#fff;border-right:1px solid #e0e0e0;display:flex;flex-direction:column;flex-shrink:0}
+.sidebar .new-btn{margin:12px;padding:10px;background:#1a1a2e;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:13px}
+.sidebar .session-list{flex:1;overflow-y:auto;padding:4px 8px}
+.sidebar .session-item{padding:10px 12px;border-radius:6px;cursor:pointer;font-size:13px;margin-bottom:2px}
+.sidebar .session-item:hover{background:#f0f0f5}
+.sidebar .session-item.active{background:#e8f0fe;color:#1a1a2e;font-weight:600}
+.sidebar .session-item .del{float:right;opacity:0;color:#999;background:none;border:none;cursor:pointer;padding:2px}
+.sidebar .session-item:hover .del{opacity:1}
+.sidebar .footer{padding:10px 12px;border-top:1px solid #e0e0e0;font-size:11px;color:#999;text-align:center}
+.chat-area{flex:1;display:flex;flex-direction:column;min-width:0}
+.messages{flex:1;overflow-y:auto;padding:16px 20px}
+.message{margin-bottom:16px;max-width:80%}
+.message.user{margin-left:auto}
+.message .bubble{padding:12px 16px;border-radius:12px;font-size:14px;line-height:1.6;white-space:pre-wrap}
+.message.user .bubble{background:#1a1a2e;color:#fff;border-bottom-right-radius:4px}
+.message.assistant .bubble{background:#fff;border:1px solid #e0e0e0;border-bottom-left-radius:4px}
+.message .time{font-size:10px;color:#999;margin-top:4px;padding:0 4px}
+.message.user .time{text-align:right}
+.thinking-indicator{padding:12px 16px;margin:8px 20px;background:#f8f9fa;border-radius:8px;border-left:3px solid #ffc107;font-size:12px;color:#666;display:none}
+.input-area{border-top:1px solid #e0e0e0;padding:12px 20px;background:#fff;display:flex;gap:8px;align-items:flex-end}
+.input-area textarea{flex:1;border:1px solid #ddd;border-radius:8px;padding:10px 12px;font-size:14px;resize:none;outline:none;max-height:120px;font-family:inherit}
+.input-area textarea:focus{border-color:#1a1a2e}
+.input-area button{padding:10px 20px;background:#1a1a2e;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px;white-space:nowrap}
+.input-area button:disabled{opacity:.4;cursor:default}
+.input-area button:hover:not(:disabled){background:#16213e}
+.detail-panel{width:380px;background:#fff;border-left:1px solid #e0e0e0;overflow-y:auto;flex-shrink:0;padding:16px;display:none}
+.detail-panel.visible{display:block}
+.detail-panel h3{font-size:13px;color:#666;margin-bottom:12px;text-transform:uppercase;letter-spacing:.5px}
+.detail-card{background:#f8f9fa;border-radius:8px;padding:12px;margin-bottom:8px;font-size:12px}
+.detail-card .part-number{font-weight:600;font-family:monospace}
+.detail-card .score{float:right;font-weight:700;color:#1a1a2e}
+.detail-card .manufacturer{color:#666;font-size:11px}
+.detail-card .btn-select{font-size:10px;padding:2px 8px;background:#e8f0fe;border:none;border-radius:4px;cursor:pointer;color:#1a1a2e;margin-top:4px}
+.detail-card .btn-select:hover{background:#d0e0fc}
+.model-selector{padding:8px 12px;border-top:1px solid #e0e0e0;display:flex;align-items:center;gap:6px;font-size:11px;color:#666}
+.model-selector select{font-size:11px;border:1px solid #ddd;border-radius:4px;padding:3px 6px;background:#fff}
+.empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:#999;gap:8px}
+.empty-state .icon{font-size:48px;opacity:.3}
+@media(max-width:768px){.sidebar{width:200px}.detail-panel{width:100%;position:fixed;top:0;right:0;z-index:100;box-shadow:-4px 0 20px rgba(0,0,0,.15)}}
+</style>
+</head>
+<body>
+<header>
+  <h1>eZmanbo</h1>
+  <span class="badge">选型</span>
+  <span id="status-dot" class="checking"></span>
+</header>
+<div class="container">
+  <aside class="sidebar" id="sidebar">
+    <button class="new-btn" onclick="newSession()">＋ 新对话</button>
+    <div class="session-list" id="session-list"></div>
+    <div class="model-selector">
+      <span>模型</span>
+      <select id="model-select" onchange="switchModel(this.value)"></select>
+    </div>
+    <div class="footer">eZmanbo · 单端口部署</div>
+  </aside>
+  <main class="chat-area">
+    <div class="messages" id="messages">
+      <div class="empty-state">
+        <div class="icon">⚡</div>
+        <div>输入选型需求开始</div>
+      </div>
+    </div>
+    <div class="thinking-indicator" id="thinking">🤔 思考中...</div>
+    <div class="input-area">
+      <textarea id="input" rows="2" placeholder="描述您的选型需求..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}"></textarea>
+      <button id="send-btn" onclick="send()">发送</button>
+    </div>
+  </main>
+  <aside class="detail-panel" id="detail-panel">
+    <h3>推荐器件</h3>
+    <div id="detail-content"></div>
+  </aside>
+</div>
+<script>
+const API = '';
+let sessionId = 'default';
+let streaming = false;
+let loading = false;
+
+// ── 初始化 ──────────────────────────────────────────
+async function init() {
+  checkHealth();
+  loadModels();
+  loadSessions();
+}
+setInterval(checkHealth, 15000);
+
+async function checkHealth() {
+  const dot = document.getElementById('status-dot');
+  try {
+    const r = await fetch('/health');
+    dot.className = r.ok ? 'online' : 'offline';
+  } catch { dot.className = 'offline'; }
+}
+
+async function loadModels() {
+  try {
+    const r = await fetch('/api/models');
+    const data = await r.json();
+    const sel = document.getElementById('model-select');
+    sel.innerHTML = data.models.map(m => `<option value="${m.id}" ${m.id===data.active?'selected':''}>${m.name}</option>`).join('');
+  } catch {}
+}
+
+async function switchModel(modelId) {
+  await fetch('/api/models/switch', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:modelId})});
+}
+
+async function loadSessions() {
+  try {
+    const r = await fetch('/agent/sessions');
+    const data = await r.json();
+    const list = document.getElementById('session-list');
+    list.innerHTML = (data.sessions||data||[]).map(s => {
+      const sid = s.session_id || s.id || s;
+      return `<div class="session-item${sid===sessionId?' active':''}" onclick="switchSession('${sid}')">
+        ${(s.title||sid).slice(0,20)}<button class="del" onclick="event.stopPropagation();deleteSession('${sid}')">×</button>
+      </div>`;
+    }).join('');
+  } catch {}
+}
+
+function switchSession(id) { sessionId = id; loadSessions(); addMessage('assistant','已切换对话'); }
+function newSession() { sessionId = 'sess_' + Date.now(); loadSessions(); addMessage('assistant','🆕 新对话已创建'); }
+async function deleteSession(id) { /* session deletion not implemented in API */ loadSessions(); }
+
+// ── 消息 ────────────────────────────────────────────
+function addMessage(role, content, extra) {
+  const el = document.getElementById('messages');
+  const empty = el.querySelector('.empty-state');
+  if (empty) empty.remove();
+  const div = document.createElement('div');
+  div.className = `message ${role}`;
+  div.id = extra?.id || ('msg_' + Date.now());
+  div.innerHTML = `<div class="bubble">${content || ''}</div>${extra?.time ? `<div class="time">${extra.time}</div>` : ''}`;
+  if (extra?.append) el.appendChild(div);
+  else el.insertBefore(div, el.querySelector('.thinking-indicator'));
+  el.scrollTop = el.scrollHeight;
+  return div;
+}
+
+function updateMessage(id, content) {
+  const el = document.getElementById(id);
+  if (el) el.querySelector('.bubble').textContent = content || '';
+}
+
+function showThinking(show) {
+  document.getElementById('thinking').style.display = show ? 'block' : 'none';
+}
+
+// ── 发送 ────────────────────────────────────────────
+async function send() {
+  const input = document.getElementById('input');
+  const btn = document.getElementById('send-btn');
+  const text = input.value.trim();
+  if (!text || loading) return;
+  input.value = '';
+  loading = true; btn.disabled = true;
+
+  addMessage('user', text, {time: new Date().toLocaleTimeString()});
+  const aid = 'msg_' + Date.now();
+  addMessage('assistant', '', {id: aid, append: true});
+  showThinking(true);
+
+  try {
+    // Step 1: classify
+    const cls = await (await fetch('/classify', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      user_input: text, has_active_selection: false, accumulated_input: '', thinking_depth: 'default'
+    })})).json();
+
+    // Step 2: analyze or chat
+    if (cls.intent === 'selection' || cls.intent === 'adjustment') {
+      showThinking(false);
+      const inp = cls.merged_input || text;
+      const resp = await fetch('/analyze', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+        user_input: inp, thinking_depth: 'default', session_id: sessionId
+      })});
+      if (resp.ok) {
+        const data = await resp.json();
+        updateMessage(aid, `✅ 选型完成！共 ${data.candidates?.length || 0} 个候选器件`);
+        showDetail(data);
+      } else {
+        const err = await resp.json();
+        updateMessage(aid, `❌ ${err.detail || '选型失败'}`);
+      }
+    } else {
+      // chat mode → stream
+      const resp = await fetch('/agent/chat/stream', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+        user_input: text, thinking_depth: 'default', session_id: sessionId
+      })});
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '', fullText = '';
+      while (true) {
+        const {done, value} = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, {stream: true});
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (line.startsWith('data:')) {
+            try { const d = JSON.parse(line.slice(5));
+              if (d.text) { fullText += d.text + '\n'; updateMessage(aid, fullText); }
+            } catch {}
+          }
+        }
+      }
+      showThinking(false);
+    }
+  } catch (e) {
+    showThinking(false);
+    updateMessage(aid, `⚠️ 连接失败: ${e.message}`);
+  }
+  loading = false; btn.disabled = false;
+}
+
+// ── 详情面板 ────────────────────────────────────────
+function showDetail(report) {
+  const panel = document.getElementById('detail-panel');
+  panel.classList.add('visible');
+  const parts = report.scored_parts || report.candidates || [];
+  panel.innerHTML = '<h3>推荐器件</h3>' +
+    parts.slice(0,5).map((sp,i) => {
+      const pn = sp.part_number || sp.part?.part_number || '?';
+      const mfr = sp.manufacturer || sp.part?.manufacturer || '';
+      const sc = sp.total_score || sp.score?.total_score || 0;
+      return `<div class="detail-card">
+        <div><span class="part-number">${pn}</span><span class="score">${Math.round(sc)}</span></div>
+        <div class="manufacturer">${mfr}</div>
+      </div>`;
+    }).join('') || '<div class="detail-card">暂无推荐</div>';
+}
+
+init();
+</script>
+</body>
+</html>

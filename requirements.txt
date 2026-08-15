@@ -20,3 +20,9 @@ rank_bm25>=0.2.2
 openpyxl>=3.1
 # B7: 数据手册 PDF 解析
 pymupdf>=1.23
+# Session store (Redis for multi-worker; falls back to in-memory)
+redis>=5.0
+# Auth + Database
+sqlalchemy>=2.0
+python-jose[cryptography]>=3.3
+passlib[bcrypt]>=1.7

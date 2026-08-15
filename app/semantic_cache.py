@@ -21,16 +21,77 @@ from __future__ import annotations
 
 import os
 import json
+import hashlib
 from pathlib import Path
 from typing import Dict, Any, Optional
-import chromadb
-from chromadb.config import Settings as ChromaSettings
 
 # ── 模型单例 ────────────────────────────────────────────────────
 _embedding_model = None
 _embedding_model_error = None
 
 MODEL_NAME = "all-MiniLM-L6-v2"
+CACHE_PROTOCOL_VERSION = "selection-v2"
+
+# These fields define the identity of a selection request. Free-form text is
+# intentionally excluded so semantically similar but electrically different
+# requests cannot reuse one another's report.
+_CONSTRAINT_FIELDS = (
+    "category",
+    "topology",
+    "input_voltage_nominal_v",
+    "input_voltage_min_v",
+    "input_voltage_max_v",
+    "output_voltage_v",
+    "output_current_a",
+    "temperature_min_c",
+    "temperature_max_c",
+    "grade",
+    "package_preference",
+    "application",
+)
+_REQUIRED_CONSTRAINT_FIELDS = (
+    "input_voltage_nominal_v",
+    "output_voltage_v",
+    "output_current_a",
+)
+
+
+def _normalize_constraint_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.strip().lower() or None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return round(float(value), 6)
+    return value
+
+
+def canonical_constraint_payload(constraints: Any) -> Optional[Dict[str, Any]]:
+    """Return the stable, complete identity payload for a selection request."""
+    if hasattr(constraints, "dict"):
+        constraints = constraints.dict()
+    elif hasattr(constraints, "__dict__"):
+        constraints = vars(constraints)
+    if not isinstance(constraints, dict):
+        return None
+
+    payload = {
+        field: _normalize_constraint_value(constraints.get(field))
+        for field in _CONSTRAINT_FIELDS
+    }
+    has_vin = payload.get("input_voltage_nominal_v") is not None or (
+        payload.get("input_voltage_min_v") is not None
+        and payload.get("input_voltage_max_v") is not None
+    )
+    if not has_vin or any(payload.get(field) is None for field in _REQUIRED_CONSTRAINT_FIELDS[1:]):
+        return None
+    return {"protocol": CACHE_PROTOCOL_VERSION, "constraints": payload}
+
+
+def canonical_constraint_fingerprint(constraints: Any) -> Optional[str]:
+    payload = canonical_constraint_payload(constraints)
+    if payload is None:
+        return None
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return f"{CACHE_PROTOCOL_VERSION}:{hashlib.sha256(encoded.encode('utf-8')).hexdigest()}"
 
 
 def _get_embedding_model():
@@ -47,14 +108,15 @@ def _get_embedding_model():
     if _embedding_model_error is not None:
         raise _embedding_model_error
 
-    # 设置 HuggingFace 镜像 + 下载超时
-    os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
+    # 检测本地缓存，避免联网版本验证导致的超时（服务器无外网时可达180s）
+    from pathlib import Path as _Path
+    _hf_hub = _Path(os.environ.get("HF_HOME", str(_Path.home() / ".cache" / "huggingface"))) / "hub"
+    _model_cached = (_hf_hub / f"models--sentence-transformers--{MODEL_NAME.replace('/', '--')}").exists()
 
     try:
         from sentence_transformers import SentenceTransformer
-        # 优先使用本地缓存，避免每次联网验证
-        _embedding_model = SentenceTransformer(MODEL_NAME, local_files_only=False)
+        # 本地有缓存 → local_files_only=True（毫秒级加载）；否则允许下载
+        _embedding_model = SentenceTransformer(MODEL_NAME, local_files_only=_model_cached)
         return _embedding_model
 
     except Exception as e:
@@ -74,42 +136,48 @@ class SemanticCache:
     模型加载失败时自动降级（get/set 均返回未命中/失败）。
     """
 
-    def __init__(self, persist_dir: str = "data/chroma_cache"):
+    def __init__(self, persist_dir: str = str(Path(__file__).resolve().parent.parent / "data" / "chroma_cache")):
         self._persist_dir = Path(persist_dir)
         self._persist_dir.mkdir(parents=True, exist_ok=True)
+        self._exact_dir = self._persist_dir / CACHE_PROTOCOL_VERSION
+        self._exact_dir.mkdir(parents=True, exist_ok=True)
 
-        # 初始化 ChromaDB 持久化客户端
+        # The exact selection cache is filesystem-backed and must be available
+        # without importing or opening the legacy Chroma vector database.
+        self._client = None
+        self._collection = None
+        self._model_available = True
+
+    def _legacy_collection(self):
+        """Lazily initialize the obsolete raw-text semantic cache."""
+        if self._collection is not None:
+            return self._collection
+        import chromadb
+        from chromadb.config import Settings as ChromaSettings
         self._client = chromadb.PersistentClient(
             path=str(self._persist_dir),
             settings=ChromaSettings(anonymized_telemetry=False),
         )
-
-        # 获取或创建缓存集合（使用 cosine 距离）
         self._collection = self._client.get_or_create_collection(
             name="semantic_cache",
             metadata={"hnsw:space": "cosine"},
         )
-
-        # 延迟加载嵌入模型（首次 get/set 时触发下载）
-        # 不在 __init__ 中加载，避免阻塞服务启动
-        self._model_available = True  # 乐观标记，首次使用时验证
+        return self._collection
 
     @property
     def count(self) -> int:
-        """返回缓存中的条目数。"""
-        return self._collection.count()
+        """返回 legacy 语义缓存中的条目数。"""
+        return self._legacy_collection().count()
 
     def get(self, query: str, threshold: float = 0.95) -> Optional[Dict[str, Any]]:
-        """查询缓存，若相似度 > threshold 则返回缓存结果。
+        """Query the legacy semantic cache.
 
-        Args:
-            query: 查询文本（通常是用户的自然语言输入）
-            threshold: 相似度阈值，默认 0.95
-
-        Returns:
-            缓存的结果字典，或 None（未命中）
+        Selection reports no longer use this method. They use the exact,
+        versioned constraint cache below so electrically different requests
+        cannot collide through embedding similarity.
         """
-        if self._collection.count() == 0:
+        collection = self._legacy_collection()
+        if collection.count() == 0:
             return None
 
         if not self._model_available:
@@ -119,7 +187,7 @@ class SemanticCache:
             model = _get_embedding_model()
             query_embedding = model.encode([query], show_progress_bar=False).tolist()
 
-            results = self._collection.query(
+            results = collection.query(
                 query_embeddings=query_embedding,
                 n_results=1,
             )
@@ -155,12 +223,45 @@ class SemanticCache:
         except Exception:
             return None
 
+    def get_exact(self, fingerprint: str) -> Optional[Dict[str, Any]]:
+        """Return a report stored under an exact canonical fingerprint."""
+        if not fingerprint:
+            return None
+        try:
+            cache_file = self._exact_dir / f"{fingerprint.split(':', 1)[-1]}.json"
+            if not cache_file.is_file():
+                return None
+            envelope = json.loads(cache_file.read_text(encoding="utf-8"))
+            if envelope.get("protocol") != CACHE_PROTOCOL_VERSION:
+                return None
+            cached = envelope.get("cached_result")
+            if not isinstance(cached, dict):
+                return None
+            return {"cached_result": cached, "similarity": 1.0, "cache_hit": True}
+        except Exception:
+            return None
+
+    def set_exact(self, fingerprint: str, result: Dict[str, Any]) -> bool:
+        """Atomically replace a complete report under its canonical fingerprint."""
+        if not fingerprint:
+            return False
+        try:
+            cache_file = self._exact_dir / f"{fingerprint.split(':', 1)[-1]}.json"
+            tmp_file = cache_file.with_suffix(".tmp")
+            envelope = {"protocol": CACHE_PROTOCOL_VERSION, "cached_result": result}
+            tmp_file.write_text(json.dumps(envelope, ensure_ascii=False), encoding="utf-8")
+            tmp_file.replace(cache_file)
+            return True
+        except Exception:
+            return False
+
     def set(self, query: str, result: Dict[str, Any]) -> bool:
         """存入缓存：将查询和结果存储到向量库。"""
         if not self._model_available:
             return False
 
         try:
+            collection = self._legacy_collection()
             model = _get_embedding_model()
             query_embedding = model.encode([query], show_progress_bar=False).tolist()
 
@@ -168,7 +269,7 @@ class SemanticCache:
             doc_id = f"cache_{hashlib.md5(query.encode()).hexdigest()[:8]}"
             cached_result_json = json.dumps(result, ensure_ascii=False)
 
-            self._collection.add(
+            collection.add(
                 ids=[doc_id],
                 embeddings=query_embedding,
                 documents=[query],

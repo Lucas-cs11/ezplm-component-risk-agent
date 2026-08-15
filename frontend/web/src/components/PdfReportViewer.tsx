@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Download, Maximize2, Minimize2, Loader2, FileText } from "lucide-react";
+import { getAuthBearer } from "@/lib/api";
 
 interface Props {
   reportType: "bom" | "risk";
@@ -23,8 +24,8 @@ export function PdfReportViewer({ reportType }: Props) {
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
-    fetch(`${API_BASE}/report/${reportType}`)
+    const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "";
+    fetch(`${API_BASE}/report/${reportType}`, { headers: getAuthBearer() })
       .then((r) => r.json())
       .then((d) => {
         if (!cancelled) {

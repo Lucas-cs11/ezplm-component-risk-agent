@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, List, Dict
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _MEM_DIR = _PROJECT_ROOT / "memory"
+_MEMORY_LOCK = threading.Lock()  # P2-3: serialize concurrent file writes
 _ENTRYPOINT = _MEM_DIR / "MEMORY.md"
 _MAX_ENTRYPOINT_LINES = 200
 _MAX_ENTRYPOINT_BYTES = 25_000
@@ -250,17 +252,18 @@ def _read_section(filename: str, section: str) -> str:
     return _extract_section(_strip_frontmatter(content), section)
 
 def _write_section(filename: str, section: str, content: str):
-    path = _MEM_DIR / f"{filename}.md"
-    if not path.exists():
-        path.write_text(f"---\ntype: {filename}\ndescription: \n---\n\n# {filename}\n\n## {section}\n\n{content}\n", encoding="utf-8")
-        return
-    text = path.read_text(encoding="utf-8")
-    pattern = rf"(##\s+{section}\s*\n)(.*?)(?=\n##\s|\Z)"
-    replacement = rf"\1{content}\n"
-    new_text = re.sub(pattern, replacement, text, flags=re.DOTALL)
-    if new_text == text:
-        new_text = text.rstrip() + f"\n\n## {section}\n\n{content}\n"
-    path.write_text(new_text, encoding="utf-8")
+    with _MEMORY_LOCK:
+        path = _MEM_DIR / f"{filename}.md"
+        if not path.exists():
+            path.write_text(f"---\ntype: {filename}\ndescription: \n---\n\n# {filename}\n\n## {section}\n\n{content}\n", encoding="utf-8")
+            return
+        text = path.read_text(encoding="utf-8")
+        pattern = rf"(##\s+{section}\s*\n)(.*?)(?=\n##\s|\Z)"
+        replacement = rf"\1{content}\n"
+        new_text = re.sub(pattern, replacement, text, flags=re.DOTALL)
+        if new_text == text:
+            new_text = text.rstrip() + f"\n\n## {section}\n\n{content}\n"
+        path.write_text(new_text, encoding="utf-8")
 
 def _prepend_section(filename: str, section: str, entry: str, keep: int = 5):
     """在 section 最前面插入条目，保留最近 N 条。"""
@@ -270,19 +273,21 @@ def _prepend_section(filename: str, section: str, entry: str, keep: int = 5):
     _write_section(filename, section, "\n".join(lines[:keep]))
 
 def _append_to(filename: str, line: str):
-    path = _MEM_DIR / f"{filename}.md"
-    if not path.exists():
-        path.write_text(f"---\ntype: {filename}\ndescription: \n---\n\n# {filename}\n\n{line}\n", encoding="utf-8")
-        return
-    text = path.read_text(encoding="utf-8")
-    path.write_text(text.rstrip() + f"\n{line}\n", encoding="utf-8")
+    with _MEMORY_LOCK:
+        path = _MEM_DIR / f"{filename}.md"
+        if not path.exists():
+            path.write_text(f"---\ntype: {filename}\ndescription: \n---\n\n# {filename}\n\n{line}\n", encoding="utf-8")
+            return
+        text = path.read_text(encoding="utf-8")
+        path.write_text(text.rstrip() + f"\n{line}\n", encoding="utf-8")
 
 def _update_field(filename: str, field: str, value: str):
-    path = _MEM_DIR / f"{filename}.md"
-    if not path.exists():
-        return
-    text = path.read_text(encoding="utf-8")
-    pattern = rf"(\*\*{field}\*\*[：:]\s*)(.+)"
-    new_text = re.sub(pattern, rf"\1{value}", text)
-    if new_text != text:
-        path.write_text(new_text, encoding="utf-8")
+    with _MEMORY_LOCK:
+        path = _MEM_DIR / f"{filename}.md"
+        if not path.exists():
+            return
+        text = path.read_text(encoding="utf-8")
+        pattern = rf"(\*\*{field}\*\*[：:]\s*)(.+)"
+        new_text = re.sub(pattern, rf"\1{value}", text)
+        if new_text != text:
+            path.write_text(new_text, encoding="utf-8")

@@ -5,7 +5,7 @@ try:
 except Exception:
     HAS_PYDANTIC = False
 
-from typing import List, Optional
+from typing import List, Optional, Dict
 if not HAS_PYDANTIC:
     from dataclasses import dataclass, field, asdict
 
@@ -50,17 +50,19 @@ if HAS_PYDANTIC:
         package: Optional[str] = None
         automotive_grade: bool = False
         lifecycle_status: Optional[str] = None
-        stock: Optional[int] = None
-        unit_price_cny: Optional[float] = None
         datasheet_url: Optional[str] = None
         ezplm_part_id: Optional[str] = None
-        replacement_for: List[str] = Field(default_factory=list)
-        source: str = "unknown"
         # ── eZ-PLM 详情富化字段（v2 新增）────────────────────────
         switching_frequency_khz: Optional[float] = None   # 开关频率（kHz）
         quiescent_current_ua: Optional[float] = None      # 静态电流（μA）
         efficiency_pct: Optional[float] = None            # 典型效率（%）
         features: List[str] = Field(default_factory=list) # 特性标签（AEC-Q100、Sync等）
+        footprint_file: Optional[str] = None              # PCB封装文件名（来自eZ-PLM）
+        symbol_file: Optional[str] = None                 # 原理图符号文件名（来自eZ-PLM）
+        replacement_for: List[str] = Field(default_factory=list)  # 被哪些型号替代
+        source: str = "unknown"                           # 数据来源（ezplm / rag / mock）
+        unit_price_cny: Optional[float] = None            # 参考单价（人民币）
+        stock: Optional[int] = None                       # 库存数量
 
     class ScoreBreakdown(BaseModel):
         parameter_match_score: float = Field(default=0.0, ge=0, le=100)
@@ -74,6 +76,7 @@ if HAS_PYDANTIC:
         llm_application_score: Optional[float] = Field(default=None, ge=0, le=100)
         llm_design_risk_score: Optional[float] = Field(default=None, ge=0, le=100)
         llm_reasoning: Optional[str] = None
+        dim_scores: Optional[Dict[str, float]] = None
 
     class ScoredPart(BaseModel):
         part: PartIR
@@ -178,6 +181,16 @@ if HAS_PYDANTIC:
         evidence: List[EvidenceIR] = Field(default_factory=list)
         summary_markdown: Optional[str] = None
         ir_version: str = "0.1"
+        reference_designs: List[dict] = Field(default_factory=list)
+        lifecycle_alerts: List[dict] = Field(default_factory=list)
+        # P2-7: reproducibility — bind report to the model that generated it
+        model_version: Optional[str] = None
+        generated_at: Optional[str] = None
+        # P2-6: IEC 62368-1 / IATF 16949 compliance metadata
+        standards_compliance: dict = Field(default_factory=lambda: {
+            "iec_62368_1": {"energy_source_class": None, "component_class": None, "safety_cert_required": None},
+            "iatf_16949": {"ppap_required": False, "supplier_approval_status": None, "change_control_level": None},
+        })
 
     class ReplacementReport(BaseModel):
         original_part: PartIR
@@ -232,12 +245,11 @@ else:
         package: Optional[str] = None
         automotive_grade: bool = False
         lifecycle_status: Optional[str] = None
-        stock: Optional[int] = None
-        unit_price_cny: Optional[float] = None
         datasheet_url: Optional[str] = None
         ezplm_part_id: Optional[str] = None
         replacement_for: List[str] = field(default_factory=list)
         source: str = "unknown"
+        unit_price_cny: Optional[float] = None
         # ── eZ-PLM 详情富化字段（v2 新增）────────────────────────
         switching_frequency_khz: Optional[float] = None
         quiescent_current_ua: Optional[float] = None
@@ -264,6 +276,7 @@ else:
         llm_application_score: Optional[float] = None
         llm_design_risk_score: Optional[float] = None
         llm_reasoning: Optional[str] = None
+        dim_scores: Optional[Dict[str, float]] = None
 
         @classmethod
         def parse_obj(cls, obj: dict):

@@ -207,7 +207,7 @@ def _score_d3_lifecycle(part: PartIR) -> Tuple[float, str]:
 def _score_d4_supply(part: PartIR) -> Tuple[float, str]:
     """D4 供应连续性风险（1–5）。"""
     stock = part.stock
-    source = (part.source or "").lower()
+    source = (getattr(part, "source", "unknown") or "").lower()
     is_ezplm = source in ("ezplm", "api", "ezplm_api")
 
     if stock is None:
@@ -257,7 +257,7 @@ def _score_d5_compliance(
         return 4.0, "要求车规但缺少 AEC-Q 认证，法规合规性不确定"
 
     # 普通场景：eZ-PLM 来源相对可信
-    source = (part.source or "").lower()
+    source = (getattr(part, "source", "unknown") or "").lower()
     if source in ("ezplm", "api", "ezplm_api"):
         return 2.0, "eZ-PLM 平台数据，RoHS/REACH 合规基础证据可信"
 
@@ -285,7 +285,7 @@ def _score_d6_quality(part: PartIR) -> Tuple[float, str]:
 
 def _score_d7_counterfeit(part: PartIR) -> Tuple[float, str]:
     """D7 假冒与渠道可信度风险（1–5）。"""
-    source = (part.source or "").lower()
+    source = (getattr(part, "source", "unknown") or "").lower()
     has_datasheet = bool(part.datasheet_url)
 
     if source in ("ezplm", "api", "ezplm_api"):
@@ -838,29 +838,23 @@ def _build_summary(
     ri = risks.risk_index or 0.0
 
     lines = [
-        "## 选型分析报告",
-        "",
-        f"**需求**：{constraints.raw_input}",
-        "",
-        f"**检索结果**：共 {len(scored)} 条候选，"
-        f"**{len(recommended)} 条推荐**，{len(backup)} 条备选"
-        + (f"，{len(not_rec)} 条不推荐" if not_rec else "") + "。",
-        "",
-        f"**整体风险等级**：{emoji} **{lc} {label}**（风险指数 {ri:.1f}/100）",
-        f"> {action}",
+        "---",
         "",
     ]
 
-    # ── 推荐器件 ──────────────────────────────────────────────────
+    # ── 推荐器件表格 ──────────────────────────────────────────────────
     if recommended:
-        lines += [f"### 推荐器件（{len(recommended)} 条）", ""]
+        lines += [
+            "### 推荐器件",
+            "",
+            "| # | 型号 | 厂商 | 评分 | 风险 | 主要特征 |",
+            "|---|------|------|:----:|:----:|----------|",
+        ]
         for idx, s in enumerate(recommended, start=1):
             p = s.part
             mfr = p.manufacturer or "—"
-            pkg = f" / {p.package}" if p.package else ""
+            pkg = p.package or ""
             dom_tag = " 🇨🇳" if getattr(p, "is_domestic", False) else ""
-
-            # 查找该器件的十维风险结果
             part_risk = next(
                 (r for r in risks.per_part_risks if r.get("part_number") == p.part_number),
                 None,
@@ -869,52 +863,28 @@ def _build_summary(
             part_ri = part_risk["risk_index"] if part_risk else "—"
             part_emoji = _LEVEL_EMOJI.get(part_lc, "?")
 
-            lines.append(
-                f"**#{idx}** `{p.part_number}`{dom_tag}  —  {mfr}{pkg}"
-            )
-            lines.append(
-                f"- 选型评分：**{int(s.score.total_score)}**"
-                f"（参数 {int(s.score.parameter_match_score)}"
-                f" | 供应 {int(s.score.supply_risk_score)}"
-                f" | 国产 {int(s.score.domestic_score)}）"
-                f"  ·  风险：{part_emoji} **{part_lc}**（{part_ri}/100）"
-            )
-
-            # 正向评分理由（最多 2 条）
+            features = []
             good = [r for r in (s.score.reasons or []) if "✓" in r or "满足" in r][:2]
-            for r in good:
-                lines.append(f"  - {r}")
-            # 负向理由（最多 1 条）
-            bad = [r for r in (s.score.reasons or []) if "✗" in r or "不满足" in r or "超出" in r][:1]
-            for r in bad:
-                lines.append(f"  - ⚠ {r}")
+            for g in good:
+                short = g.replace("✓ ", "").split("，")[0][:30]
+                features.append(short)
+            feature_str = "；".join(features) if features else pkg[:20] if pkg else "—"
+            lines.append(
+                f"| {idx} | `{p.part_number}`{dom_tag} | {mfr} | **{int(s.score.total_score)}** | {part_emoji} {part_lc} | {feature_str} |"
+            )
+        lines.append("")
 
-            # 显示最严重的 1–2 个风险维度
-            if part_risk:
-                high_dims = sorted(
-                    [(k, v) for k, v in part_risk["dimension_scores"].items() if v >= 3.0],
-                    key=lambda x: -x[1]
-                )[:2]
-                for dim, score in high_dims:
-                    dim_name = _DIMENSION_NAMES[dim]
-                    dim_emoji = "🔴" if score >= 4.0 else "🟠"
-                    reason = part_risk["dimension_reasons"].get(dim, "")
-                    lines.append(f"  - {dim_emoji} {dim} {dim_name}（{score:.0f}/5）：{reason}")
-
-            # 门禁触发（若有）
-            if part_risk and part_risk.get("gate_triggers"):
-                for g in part_risk["gate_triggers"][:2]:
-                    lines.append(f"  - ⛔ {g}")
-
-            lines.append("")
-
-    # ── 备选器件 ──────────────────────────────────────────────────
+    # ── 备选器件表格 ──────────────────────────────────────────────────
     if backup:
-        lines += [f"### 备选器件（{len(backup)} 条）", ""]
+        lines += [
+            "### 备选器件",
+            "",
+            "| # | 型号 | 厂商 | 评分 | 风险 |",
+            "|---|------|------|:----:|:----:|",
+        ]
         start_idx = len(recommended) + 1
         for idx, s in enumerate(backup, start=start_idx):
             p = s.part
-            mfr = p.manufacturer or "—"
             dom_tag = " 🇨🇳" if getattr(p, "is_domestic", False) else ""
             part_risk = next(
                 (r for r in risks.per_part_risks if r.get("part_number") == p.part_number),
@@ -923,34 +893,19 @@ def _build_summary(
             part_lc = part_risk["risk_level_code"] if part_risk else "—"
             part_emoji = _LEVEL_EMOJI.get(part_lc, "?")
             lines.append(
-                f"**#{idx}** `{p.part_number}`{dom_tag}  —  {mfr}"
-                f"  评分 **{int(s.score.total_score)}**"
-                f"  ·  风险 {part_emoji} {part_lc}"
+                f"| {idx} | `{p.part_number}`{dom_tag} | {p.manufacturer or '—'} | {int(s.score.total_score)} | {part_emoji} {part_lc} |"
             )
         lines.append("")
 
-    # ── 不推荐器件 ────────────────────────────────────────────────
-    if not_rec:
-        start_idx = len(recommended) + len(backup) + 1
-        lines += [f"### 不推荐器件（{len(not_rec)} 条）", ""]
-        for idx, s in enumerate(not_rec, start=start_idx):
-            p = s.part
-            lines.append(
-                f"**#{idx}** `{p.part_number}`  —  {p.manufacturer or '—'}"
-                f"  评分 **{int(s.score.total_score)}**"
-            )
-        lines.append("")
-
-    # ── 风险摘要 ──────────────────────────────────────────────────
+    # ── 风险维度表 ──────────────────────────────────────────────────
     lines += [
         "---",
         "",
-        "### 风险评估摘要（ISO 31000 / IEC 60812 十维模型）",
+        "### 风险评估维度",
         "",
-        f"| 维度 | 名称 | 权重 | 最高评分 |",
-        f"|---|---|---:|---:|",
+        "| 维度 | 名称 | 权重 | 最优评分 |",
+        "|------|------|:----:|:--------:|",
     ]
-
     if risks.per_part_risks:
         for dim, weight in _DIMENSION_WEIGHTS.items():
             max_score = max(
@@ -962,17 +917,16 @@ def _build_summary(
             )
     lines.append("")
 
-    # ── 门禁项 ────────────────────────────────────────────────────
+    # ── 摘要项 ──────────────────────────────────────────────────
     if risks.gate_items_triggered:
-        lines += ["### ⛔ 门禁项触发", ""]
+        lines += ["**门禁触发**\n"]
         for g in risks.gate_items_triggered:
             lines.append(f"- {g}")
         lines.append("")
 
-    # ── 供应链与工程摘要 ─────────────────────────────────────────
     lines += [
-        f"**供应链风险**：{risks.supply_risk_summary}",
-        f"**工程技术风险**：{risks.engineering_risk_summary}",
+        f"- **供应链风险**：{risks.supply_risk_summary}" if risks.supply_risk_summary else "",
+        f"- **工程风险**：{risks.engineering_risk_summary}" if risks.engineering_risk_summary else "",
     ]
 
     return "\n".join(lines)

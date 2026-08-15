@@ -1,11 +1,15 @@
 import os
 import json as _json
 import requests
+import time as _time
 from typing import List, Dict, Any, Optional
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+from .llm_config import get_api_key, get_base_url, get_model
+
+
+class ContextLengthExceededError(Exception):
+    """上下文窗口超限异常，上层可捕获后触发压缩降级。"""
+    pass
 
 # ── Function Calling Tool Schema（P2：结构化需求提取）───────────
 
@@ -86,46 +90,128 @@ def call_openai_chat(
     temperature: float = 0.0,
     tools: Optional[List[dict]] = None,
     tool_choice: Optional[str] = None,
+    thinking_depth: str = "default",
+    model_override: Optional[str] = None,
+    api_key_override: Optional[str] = None,
+    base_url_override: Optional[str] = None,
 ) -> dict:
     """Call OpenAI-compatible /v1/chat/completions endpoint.
 
-    Returns: {"content": str, "tool_calls": list} — content 可能为空（tool call 模式）。
+    支持 DeepSeek 思考模式：
+    - thinking_depth="off"     → 显式关闭思考模式
+    - thinking_depth="default" → 启用思考（reasoning_effort="high"）
+    - thinking_depth="contemplation" → 同 default
+    - thinking_depth="exhaustive"    → reasoning_effort="max"
+
+    Returns: {"content": str, "tool_calls": list, "reasoning_content": Optional[str]}
     """
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not set in environment")
-    model = model or OPENAI_MODEL
-    url = OPENAI_BASE_URL.rstrip("/") + "/v1/chat/completions"
+    api_key = api_key_override or get_api_key()
+    if not api_key:
+        raise RuntimeError("LLM API key not set in environment (checked ANTHROPIC_* then OPENAI_*)")
+    model = model_override or model or get_model() or "gpt-3.5-turbo"
+    base_url = base_url_override or get_base_url() or "https://api.openai.com"
+    _base = base_url.rstrip("/")
+    # Strip API endpoint suffixes users may accidentally include in the base URL
+    for _sfx in ("/v1/messages", "/v1/chat/completions", "/v1/chat", "/v1/completions", "/messages"):
+        if _base.endswith(_sfx):
+            _base = _base[: -len(_sfx)]
+            break
+    url = (_base + "/chat/completions") if _base.endswith("/v1") else (_base + "/v1/chat/completions")
     headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     payload: dict = {
         "model": model,
         "messages": messages,
-        "temperature": temperature,
         "max_tokens": 800,
     }
+
+    # ── DeepSeek 思考模式处理 ────────────────────────────
+    is_deepseek = model.startswith("deepseek")
+    if is_deepseek:
+        if thinking_depth == "off":
+            payload["temperature"] = temperature
+            payload["extra_body"] = {"thinking": {"type": "disabled"}}
+        else:
+            effort = "max" if thinking_depth == "exhaustive" else "high"
+            payload["reasoning_effort"] = effort
+            payload["extra_body"] = {"thinking": {"type": "enabled"}}
+    else:
+        payload["temperature"] = temperature
+
     if tools:
         payload["tools"] = tools
-    if tool_choice:
+    if tool_choice and not is_deepseek:
         payload["tool_choice"] = tool_choice
 
-    resp = requests.post(url, headers=headers, json=payload, timeout=30)
-    resp.raise_for_status()
+    # ── 重试逻辑：应对 DeepSeek API 临时故障 / 限流 ──────────
+    max_retries = 3
+    last_exc = None
+    # 思考模式下 API 响应可能较慢，放宽超时
+    request_timeout = 300 if thinking_depth != "off" else 60
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=request_timeout)
+            resp.raise_for_status()
+            break  # 成功则跳出重试循环
+        except Exception as e:
+            last_exc = e
+            if attempt < max_retries - 1:
+                # 仅对可重试错误重试：超时、429、5xx
+                status = getattr(e.response if hasattr(e, 'response') else None, 'status_code', 0) if hasattr(e, 'response') else 0
+                if status in (429, 500, 502, 503, 504) or isinstance(e, (requests.Timeout, ConnectionError)):
+                    sleep_s = 1.5 ** (attempt + 1)  # 指数退避：1.5s, 2.25s, 3.375s
+                    _time.sleep(sleep_s)
+                    continue
+            # 不可重试的错误或最后一次尝试失败时记录日志
+            try:
+                from .log_util import log_error
+                body = resp.text if 'resp' in dir() and hasattr(resp, 'text') else str(e)
+                log_error("llm_client", e, "call_openai_chat", extra={
+                    "downstream_status": getattr(resp, 'status_code', 'unknown') if 'resp' in dir() else 'unknown',
+                    "downstream_body": body[:2000],
+                    "attempt": attempt + 1,
+                })
+            except Exception:
+                pass
+            # 检测上下文窗口超限，抛出专用异常供上层降级处理
+            status_code = getattr(resp, 'status_code', 0) if 'resp' in dir() else 0
+            error_body = body[:300] if 'body' in dir() else str(e)
+            if isinstance(error_body, str) and any(kw in error_body.lower() for kw in (
+                'context_length_exceeded', 'maximum context length',
+                'too many tokens', 'prompt is too long', '413'
+            )):
+                raise ContextLengthExceededError(f"上下文超限: {error_body}") from e
+            raise RuntimeError(f"Error code: {status_code} - {error_body}") from e
     data = resp.json()
 
-    result: dict = {"content": "", "tool_calls": []}
+    result: dict = {"content": "", "tool_calls": [], "reasoning_content": None}
     if "choices" in data and len(data["choices"]) > 0:
         choice = data["choices"][0]
         msg = choice.get("message", {})
-        result["content"] = msg.get("content", "") or ""
+        raw_content = msg.get("content")
+        # Handle Claude-style content array (thinking + text blocks)
+        if isinstance(raw_content, list):
+            text_parts = [b.get("text", "") for b in raw_content
+                          if isinstance(b, dict) and b.get("type") == "text"]
+            think_parts = [b.get("thinking", "") for b in raw_content
+                           if isinstance(b, dict) and b.get("type") in ("thinking", "reasoning_content")]
+            content = "".join(filter(None, text_parts))
+            thinking_from_blocks = "".join(filter(None, think_parts))
+        else:
+            content = raw_content or ""
+            thinking_from_blocks = ""
+        reasoning = msg.get("reasoning_content") or thinking_from_blocks or ""
+        result["content"] = content or reasoning
         result["tool_calls"] = msg.get("tool_calls", [])
+        result["reasoning_content"] = reasoning or None
     return result
 
 
-def call_openai_chat_text(messages: List[Dict[str, str]], model: Optional[str] = None, temperature: float = 0.0) -> str:
+def call_openai_chat_text(messages: List[Dict[str, str]], model: Optional[str] = None, temperature: float = 0.0, thinking_depth: str = "default") -> str:
     """向后兼容：返回纯文本。"""
-    return call_openai_chat(messages, model, temperature)["content"]
+    return call_openai_chat(messages, model, temperature, thinking_depth=thinking_depth)["content"]
 
 
 def score_part_with_llm(

@@ -4,13 +4,12 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { useChatStore, generateId } from "@/store/chat";
 import { MessageBubble } from "@/components/MessageBubble";
 import { PdfReportViewer } from "@/components/PdfReportViewer";
-import { QuickPhrases } from "@/components/QuickPhrases";
-import { ThinkingDepthPanel } from "@/components/ThinkingDepth";
-import { FileUpload } from "@/components/FileUpload";
-import { Send, Loader2, Slash, PanelLeftOpen, PanelLeftClose, PanelRightOpen, PanelRightClose, Brain, Upload, Zap } from "lucide-react";
-import { getThinkingDepth } from "@/components/ThinkingDepth";
+import { ParameterForm } from "@/components/ParameterForm";
+import { Send, Loader2, Slash, PanelLeftOpen, PanelLeftClose, PanelRightOpen, PanelRightClose, Zap } from "lucide-react";
 import { estimateConversationTokens, COMPACT_THRESHOLD } from "@/lib/tokenBudget";
-import { buildSelectionContext } from "@/lib/utils";
+import { buildSelectionContext, cn } from "@/lib/utils";
+import { getApiHeaders, getAuthBearer } from "@/lib/api";
+import { useAuthStore } from "@/store/authStore";
 import type { AnalysisReport } from "@/types";
 
 interface SSEStage { stage: string; status: string; total?: number; }
@@ -33,8 +32,8 @@ const SLASH_COMMANDS: Record<string, { desc: string; action: (ctx: CmdCtx) => vo
   export: {
     desc: "下载 BOM Excel",
     action: () => {
-      const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
-      fetch(`${API_BASE}/export/bom`, { method: "POST" })
+      const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "";
+      fetch(`${API_BASE}/export/bom`, { method: "POST", headers: getAuthBearer() })
         .then(r => r.blob())
         .then(blob => {
           const url = URL.createObjectURL(blob);
@@ -77,7 +76,9 @@ type CmdCtx = {
 const STAGE_INFO: Record<string, { label: string; pct: number }> = {
   parse:    { label: "解析需求", pct: 10 },
   search:   { label: "检索器件库", pct: 25 },
+  enrich:   { label: "富化器件详情", pct: 38 },
   score:    { label: "评分中", pct: 55 },
+  analysis: { label: "证据+风险分析", pct: 72 },
   evidence: { label: "构建证据链", pct: 75 },
   risk:     { label: "风险评估", pct: 90 },
   report:   { label: "生成报告", pct: 98 },
@@ -85,11 +86,13 @@ const STAGE_INFO: Record<string, { label: string; pct: number }> = {
 
 /* ══════════════════════════════════════════════════════════════ */
 
-export function ChatArea({ leftOpen, rightOpen, onToggleLeft, onToggleRight }: {
+export function ChatArea({ leftOpen, rightOpen, onToggleLeft, onToggleRight, onToggleMobileMenu }: {
   leftOpen: boolean; rightOpen: boolean;
   onToggleLeft: () => void; onToggleRight: () => void;
+  onToggleMobileMenu?: () => void;
 }) {
-  const { activeSession, addMessage, updateMessage, setStreaming, createSession, setSessionTitle, healthStatus, setHealthStatus } = useChatStore();
+  const { activeSession, addMessage, updateMessage, setStreaming, createSession, setSessionTitle, healthStatus, setHealthStatus, pendingInput, setPendingInput, thinkingDepth, pushToolCallEvent, clearToolCallEvents } = useChatStore();
+  const { canSendAsGuest, incrementGuestCount, user: authUser } = useAuthStore();
   const session = activeSession();
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -100,24 +103,35 @@ export function ChatArea({ leftOpen, rightOpen, onToggleLeft, onToggleRight }: {
   const [activeReport, setActiveReport] = useState<"bom" | "risk" | null>(null);
   const [currentIntent, setCurrentIntent] = useState<"selection" | "chat" | "adjustment" | "clarify" | null>(null);
   const [showThinking, setShowThinking] = useState(false);
-  const [showUpload, setShowUpload] = useState(false);
   const [accumulatedInput, setAccumulatedInput] = useState("");  // 跨轮累积的约束文本
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const streamingMsgId = useRef<string | null>(null);
   const inputTextRef = useRef("");  // 同步最新输入值，供 slash command 读取参数
 
-  // ── 派生：当前会话是否有活跃选型结果 ──────────────
+  // A report in the session is the source of truth for follow-up selection,
+  // independent of the classifier label used for the latest message.
   const hasActiveSelection = session?.messages.some(
-    (m) => m.role === "assistant" && m.report && !m.isStreaming
+    (m) => m.role === "assistant" && Boolean(
+      m.report && ((m.report.candidates?.length ?? 0) > 0 || (m.report.recommended_parts?.length ?? 0) > 0)
+    )
   ) ?? false;
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [session?.messages]);
 
+  // Watch pendingInput from DetailPanel "选择此器件" button
+  useEffect(() => {
+    if (!pendingInput || loading) return;
+    const text = pendingInput;
+    setPendingInput(null);
+    handleSend(text);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingInput]);
+
   // ── 后端连接健康检查（30s 轮询）──────────────────
   useEffect(() => {
     const checkHealth = async () => {
-      const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+      const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "";
       setHealthStatus("checking");
       try {
         const resp = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(5000) });
@@ -158,11 +172,11 @@ export function ChatArea({ leftOpen, rightOpen, onToggleLeft, onToggleRight }: {
         ).join("\n");
         const aid = generateId();
         addMessage({ id: aid, role: "assistant", content: "", timestamp: Date.now() });
-        const _API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+        const _API = process.env.NEXT_PUBLIC_API_BASE || "";
         try {
           const resp = await fetch(`${_API}/agent/chat`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: getApiHeaders(),
             body: JSON.stringify({
               user_input: `请将以下对话历史压缩为一段简洁摘要（不超过200字），保留关键器件型号和参数：\n${summary}`,
               session_id: session?.id,
@@ -182,13 +196,13 @@ export function ChatArea({ leftOpen, rightOpen, onToggleLeft, onToggleRight }: {
         const fullCmd = inputTextRef.current.trim();
         const mpn = fullCmd.replace(/^\/replace\s+/i, "").trim();
         if (!mpn) return;
-        const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+        const API = process.env.NEXT_PUBLIC_API_BASE || "";
         const aid = generateId();
         addMessage({ id: aid, role: "assistant", content: `正在查询 \`${mpn}\` 的替代器件...`, timestamp: Date.now(), isStreaming: true });
         try {
           const resp = await fetch(`${API}/replacement`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: getApiHeaders(),
             body: JSON.stringify({ original_part_number: mpn }),
           });
           if (!resp.ok) {
@@ -317,16 +331,26 @@ export function ChatArea({ leftOpen, rightOpen, onToggleLeft, onToggleRight }: {
   };
 
   /* ── SSE 流式接收器（共享） ────────────────────── */
-  const consumeSelectionStream = async (aid: string, resp: Response) => {
+  const consumeSelectionStream = async (aid: string, resp: Response, userInput: string = "") => {
+    const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "";
     const reader = resp.body?.getReader();
     if (!reader) throw new Error("No stream");
     const decoder = new TextDecoder();
     let buffer = "", fullText = "", thinkingText = "", thinkingDone = false;
+    let lastReadAt = Date.now();
+    const STREAM_TIMEOUT = 300000;
     const report: Partial<AnalysisReport> = {};
 
     try {
     while (true) {
-      const { done, value } = await reader.read();
+      if (Date.now() - lastReadAt > STREAM_TIMEOUT) throw new Error("Stream timeout");
+      const readPromise = reader.read();
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Read timeout")), 60000)
+      );
+      const { done, value } = await Promise.race([readPromise, timeoutPromise]);
+      if (done) break;
+      lastReadAt = Date.now();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
@@ -378,6 +402,8 @@ export function ChatArea({ leftOpen, rightOpen, onToggleLeft, onToggleRight }: {
             report.elapsed_s = d.elapsed_s;
             report.request_id = d.request_id;
             if (d.summary) report.summary = d.summary;
+            if (d.recommended_parts) report.recommended_parts = d.recommended_parts;
+            if (d.candidates)        report.candidates        = d.candidates;
             // 提取选型标题（≤10字）
             if (report.constraints) {
               const c = report.constraints;
@@ -404,7 +430,7 @@ export function ChatArea({ leftOpen, rightOpen, onToggleLeft, onToggleRight }: {
 
     // ── 选型完成后将上下文注入后端 Agent 会话 ────────
     if (session && (report as AnalysisReport).constraints) {
-      const _API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+      const _API = process.env.NEXT_PUBLIC_API_BASE || "";
       fetch(`${_API}/agent/init_session`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -416,22 +442,49 @@ export function ChatArea({ leftOpen, rightOpen, onToggleLeft, onToggleRight }: {
       }).catch(() => {});
     }
     } catch (_streamErr) {
-      // M6: 连接中断时保留已接收内容并提示重发
-      const retained = fullText ? fullText + "\n\n> ⚠️ 连接中断，请点击重新发送" : "> ⚠️ 连接中断，请点击重新发送";
+      // 流式失败 → 降级到非流式 /analyze
+      if (!fullText && userInput) {
+        try {
+          const fbResp = await fetch(`${API_BASE}/analyze`, {
+            method: "POST",
+            headers: getApiHeaders(),
+            body: JSON.stringify({ user_input: userInput, thinking_depth: "default", session_id: useChatStore.getState().activeSessionId }),
+          });
+          if (fbResp.ok) {
+            const fbData = await fbResp.json();
+            fullText = "（非流式恢复）\n\n" + JSON.stringify(fbData, null, 2).slice(0, 2000);
+            updateMessage(aid, { content: fullText, report: fbData, isStreaming: false, thinkingDone: true });
+            return;
+          }
+        } catch { /* 降级也失败 */ }
+      }
+      const retained = fullText ? fullText + "\n\n> ⚠️ 连接中断，请点击重新发送" : "> ⚠️ 连接中断，已尝试非流式恢复，请点击重新发送";
       updateMessage(aid, { content: retained, report: Object.keys(report).length > 0 ? (report as AnalysisReport) : undefined, isStreaming: false, thinkingDone: true });
       setProgress((p) => ({ ...p, pct: 0 }));
     }
   };
 
-  const consumeChatStream = async (aid: string, resp: Response) => {
+  const consumeChatStream = async (aid: string, resp: Response, userInput: string = "") => {
+    const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "";
     const reader = resp.body?.getReader();
     if (!reader) throw new Error("No stream");
     const decoder = new TextDecoder();
     let buffer = "", fullText = "", thinkingText = "";
+    let lastReadAt = Date.now();
+    const STREAM_TIMEOUT = 300000; // 300s 无数据则超时（思考模式可能较慢）
     try {
     while (true) {
-      const { done, value } = await reader.read();
+      // 流式读取超时检测
+      if (Date.now() - lastReadAt > STREAM_TIMEOUT) {
+        throw new Error("Stream timeout");
+      }
+      const readPromise = reader.read();
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Read timeout")), 120000) // 120s/块（思考模式放宽）
+      );
+      const { done, value } = await Promise.race([readPromise, timeoutPromise]);
       if (done) break;
+      lastReadAt = Date.now();
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
@@ -441,6 +494,17 @@ export function ChatArea({ leftOpen, rightOpen, onToggleLeft, onToggleRight }: {
         if (!line.startsWith("data:")) continue;
         try {
           const d = JSON.parse(line.slice(5));
+          // Push non-noisy events to the tool call log
+          if (!["text_delta", "thinking_delta"].includes(ce)) {
+            const labels: Record<string, string> = {
+              start: "流水线启动", intent: `意图: ${(d as any)?.intent ?? ""}`,
+              parse_done: "约束解析完成", score_update: `评分: ${(d as any)?.part_number ?? ""}`,
+              evidence_done: "证据生成完成", risk_done: "风险评估完成",
+              clarify_fields: "需补充参数", done: `完成 (${(d as any)?.elapsed_s?.toFixed(1) ?? ""}s)`,
+              error: `错误: ${(d as any)?.message ?? ""}`,
+            };
+            if (labels[ce]) pushToolCallEvent({ type: ce, label: labels[ce] });
+          }
           if (ce === "thinking_delta") {
             thinkingText += (d.text || "") + "\n";
             updateMessage(aid, { thinking: thinkingText });
@@ -465,16 +529,223 @@ export function ChatArea({ leftOpen, rightOpen, onToggleLeft, onToggleRight }: {
     }
     updateMessage(aid, { content: fullText || "已处理", isStreaming: false, thinkingDone: true });
     } catch (_streamErr) {
-      // M6: 连接中断时保留已接收内容并提示重发
-      const retained = fullText ? fullText + "\n\n> ⚠️ 连接中断，请点击重新发送" : "> ⚠️ 连接中断，请点击重新发送";
+      // 流式失败 → 降级到非流式请求
+      if (!fullText && userInput) {
+        try {
+          const fallbackResp = await fetch(`${API_BASE}/agent/chat`, {
+            method: "POST",
+            headers: getApiHeaders(),
+            body: JSON.stringify({ user_input: userInput, session_id: useChatStore.getState().activeSessionId }),
+          });
+          if (fallbackResp.ok) {
+            const fbData = await fallbackResp.json();
+            const fbText = fbData.response || fbData.output || JSON.stringify(fbData);
+            updateMessage(aid, { content: fbText, isStreaming: false, thinkingDone: true });
+            return;
+          }
+        } catch { /* 降级也失败 */ }
+      }
+      const retained = fullText ? fullText + "\n\n> ⚠️ 连接中断，请点击重新发送" : "> ⚠️ 连接中断，已尝试非流式恢复，请点击重新发送";
       updateMessage(aid, { content: retained, isStreaming: false, thinkingDone: true });
     }
   };
 
+  /* ── 统一流式消费器（对应后端 /chat/stream）──────────────── */
+  const consumeUnifiedStream = async (aid: string, resp: Response, userInput: string = "") => {
+    const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "";
+    const reader = resp.body?.getReader();
+    if (!reader) throw new Error("No stream");
+    const decoder = new TextDecoder();
+    let buffer = "", fullText = "", thinkingText = "", thinkingDone = false;
+    let lastReadAt = Date.now();
+    let detectedIntent = "chat";
+    const STREAM_TIMEOUT = 300000;
+    const report: Partial<AnalysisReport> = {};
+
+    try {
+      while (true) {
+        if (Date.now() - lastReadAt > STREAM_TIMEOUT) throw new Error("Stream timeout");
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise<never>((_, rej) => setTimeout(() => rej(new Error("Read timeout")), 120000)),
+        ]);
+        if (done) break;
+        lastReadAt = Date.now();
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        let ce = "";
+        for (const line of lines) {
+          if (line.startsWith("event:")) { ce = line.slice(6).trim(); continue; }
+          if (!line.startsWith("data:")) continue;
+          try {
+            const d = JSON.parse(line.slice(5));
+            // Push pipeline events to 调用日志
+            if (!["text_delta", "thinking_delta", "stage", "score_update"].includes(ce)) {
+              const evtLabels: Record<string, string> = {
+                intent: `意图: ${(d as any)?.intent ?? ""}`,
+                parse_done: "约束解析完成",
+                evidence_done: "证据生成完成",
+                risk_done: "风险评估完成",
+                clarify_fields: "需补充参数",
+                lifecycle_alert: "生命周期预警",
+                done: `完成 (${(d as any)?.elapsed_s?.toFixed(1) ?? ""}s)`,
+                error: `错误: ${(d as any)?.message ?? ""}`,
+              };
+              if (evtLabels[ce]) pushToolCallEvent({ type: ce, label: evtLabels[ce] });
+            }
+            if (ce === "intent") {
+              detectedIntent = d.intent || "chat";
+              setCurrentIntent(detectedIntent as "selection" | "chat" | "adjustment" | "clarify");
+              if (detectedIntent === "clarify") {
+                setAccumulatedInput(prev => prev ? `${prev}; ${userInput}` : userInput);
+              } else if (detectedIntent === "selection" || detectedIntent === "adjustment") {
+                setAccumulatedInput("");
+              }
+            } else if (ce === "thinking_delta") {
+              thinkingText += (d.text || "") + "\n";
+              updateMessage(aid, { thinking: thinkingText });
+            } else if (ce === "stage") {
+              const s = d as SSEStage;
+              setStage(s.stage);
+              const info = STAGE_INFO[s.stage] || { label: s.stage, pct: 50 };
+              if (s.total) setProgress({ current: 0, total: s.total, pct: info.pct });
+              else setProgress(p => ({ ...p, pct: info.pct }));
+            } else if (ce === "score_update") {
+              const su = d as SSEScore;
+              const pct = su.total > 0 ? Math.round(25 + (su.index / su.total) * 35) : 55;
+              setProgress({ current: su.index, total: su.total, pct });
+              // 不将评分条目追加到正文，仅更新进度条；分析文本由 text_delta 提供
+              if (!thinkingDone && thinkingText) { thinkingDone = true; updateMessage(aid, { thinkingDone: true }); }
+            } else if (ce === "text_delta") {
+              if (!thinkingDone && thinkingText) { thinkingDone = true; updateMessage(aid, { thinkingDone: true }); }
+              fullText += (d.text || "") + "\n";
+              updateMessage(aid, { content: fullText });
+            } else if (ce === "parse_done") {
+              if (d.constraints) report.constraints = d.constraints;
+            } else if (ce === "risk_done") {
+              report.risks = d;
+            } else if (ce === "evidence_done") {
+              report.evidence_count = d.evidence_count;
+              report.avg_confidence = d.avg_confidence;
+              if (d.evidence_items) report.evidence_items = d.evidence_items;
+            } else if (ce === "clarify_fields") {
+              // Store missing fields so MessageBubble can render ParameterForm
+              if (d.missing_p0?.length) {
+                updateMessage(aid, { missing_fields: d.missing_p0, accumulated_constraints: d.accumulated ?? {} });
+              }
+            } else if (ce === "lifecycle_alert" && d.alerts?.length) {
+              report.lifecycle_alerts = d.alerts;
+              if (d.has_high) {
+                const highParts = d.alerts.filter((a: any) => a.severity === "HIGH").map((a: any) => a.part_number).join("、");
+                fullText += `\n> ⚠️ **生命周期告警**：${highParts} 已停产，系统已自动查询替代料\n\n`;
+                updateMessage(aid, { content: fullText });
+              }
+            } else if (ce === "reference_designs" && d.designs?.length) {
+              report.reference_designs = d.designs;
+            } else if (ce === "agent_activity") {
+              // 显示多智能体活动状态到思考面板
+              const done = (d.status || "").includes("完成") || (d.status || "").includes("找到");
+              thinkingText += `${done ? "✓" : "⟳"} [${d.agent}] ${d.status}\n`;
+              updateMessage(aid, { thinking: thinkingText });
+              if (d.phase) {
+                const info = STAGE_INFO[d.phase];
+                if (info) setProgress(p => ({ ...p, pct: info.pct }));
+              }
+            } else if (ce === "done") {
+              report.elapsed_s = d.elapsed_s;
+              report.request_id = d.request_id;
+              if (d.summary) report.summary = d.summary;
+              if (d.recommended_parts) report.recommended_parts = d.recommended_parts;
+              if (d.candidates)        report.candidates        = d.candidates;
+              if (d.intent === "selection_choice" && d.selected_part) {
+                const pn = d.selected_part as string;
+                useChatStore.getState().setSelectedPart(pn);
+                fetch(`${API_BASE}/select-part`, {
+                  method: "POST", headers: getApiHeaders(),
+                  body: JSON.stringify({ session_id: useChatStore.getState().activeSessionId, part_number: pn }),
+                }).catch(() => {});
+                fullText = `✅ 已选定 **${pn}**\n\n您可以通过下方按钮导出 BOM / 风险评估报告。`;
+                updateMessage(aid, { content: fullText, isStreaming: false });
+                setStreaming(aid, false); setCurrentIntent(null); setLoading(false);
+                streamingMsgId.current = null;
+                return;
+              }
+              if (report.constraints) {
+                const c = report.constraints;
+                const parts: string[] = [];
+                if (c.topology) parts.push(c.topology === "buck" ? "Buck" : c.topology === "boost" ? "Boost" : c.topology === "ldo" ? "LDO" : c.topology);
+                if (c.output_voltage_v) parts.push(`${c.output_voltage_v}V`);
+                if (c.output_current_a) parts.push(`${c.output_current_a}A`);
+                const title = parts.join(" ") + " 选型";
+                if (title.length <= 12 && session) setSessionTitle(session.id, title);
+              }
+            } else if (ce === "error") {
+              updateMessage(aid, { content: `> ⚠️ ${d.message || "服务器内部错误"}`, isStreaming: false });
+              setStreaming(aid, false); return;
+            }
+          } catch { /* skip */ }
+          ce = "";
+        }
+      }
+      // Finalize from the data contract, not the classifier label. Classifier
+      // drift must not discard a valid selection report returned by the backend.
+      const hasStructuredReport = Boolean(
+        report.constraints ||
+        report.risks ||
+        (report.candidates?.length ?? 0) > 0 ||
+        (report.recommended_parts?.length ?? 0) > 0 ||
+        (report.evidence_items?.length ?? 0) > 0 ||
+        (report.evidence_count ?? 0) > 0
+      );
+      updateMessage(aid, {
+        content: fullText || "已处理",
+        report: hasStructuredReport ? (report as AnalysisReport) : undefined,
+        isStreaming: false,
+        thinkingDone: true,
+      });
+      if (hasStructuredReport && session && (report as AnalysisReport).constraints) {
+        fetch(`${API_BASE}/agent/init_session`, {
+          method: "POST", headers: getApiHeaders(),
+          body: JSON.stringify({
+            session_id: session.id,
+            context_type: "selection_context",
+            context: buildSelectionContext(report as AnalysisReport),
+          }),
+        }).catch(() => {});
+      }
+    } catch (_err) {
+      if (!fullText && userInput) {
+        try {
+          const fb = await fetch(`${API_BASE}/agent/chat`, {
+            method: "POST", headers: getApiHeaders(),
+            body: JSON.stringify({ user_input: userInput, session_id: useChatStore.getState().activeSessionId }),
+          });
+          if (fb.ok) {
+            const fbd = await fb.json();
+            updateMessage(aid, { content: fbd.response || fbd.output || "已处理", isStreaming: false, thinkingDone: true });
+            return;
+          }
+        } catch { /* ignore */ }
+      }
+      updateMessage(aid, {
+        content: fullText ? fullText + "\n\n> ⚠️ 连接中断" : "> ⚠️ 连接中断，请重试",
+        report: Object.keys(report).length > 0 ? (report as AnalysisReport) : undefined,
+        isStreaming: false, thinkingDone: true,
+      });
+    }
+  };
+
   /* ── 发送消息 + 意图分流 ──────────────────────── */
-  const handleSend = useCallback(async () => {
-    const text = input.trim();
+  const handleSend = useCallback(async (overrideText?: string) => {
+    const text = (overrideText ?? input).trim();
     if (!text || loading) return;
+    // Guest quota check
+    if (!canSendAsGuest()) {
+      addMessage({ id: generateId(), role: "assistant", content: "游客试用已达到 5 次上限，请注册账号（待开放）或联系管理员获取访问权限。", timestamp: Date.now() });
+      return;
+    }
+    if (authUser?.is_guest) incrementGuestCount();
     setInput("");
     setLoading(true);
     setStage("");
@@ -498,11 +769,11 @@ export function ChatArea({ leftOpen, rightOpen, onToggleLeft, onToggleRight }: {
       // 自动压缩：调用 LLM 摘要
       const compactId = generateId();
       addMessage({ id: compactId, role: "assistant", content: "对话较长，自动压缩上下文中...", timestamp: Date.now(), isStreaming: false });
-      const _COMPACT_API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+      const _COMPACT_API = process.env.NEXT_PUBLIC_API_BASE || "";
       try {
         const compactResp = await fetch(`${_COMPACT_API}/agent/chat`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: getApiHeaders(),
           body: JSON.stringify({
             user_input: `总结以下对话的关键信息（器件型号、参数、约束），不超过150字：\n${msgs.slice(-10).map(m => `[${m.role}]: ${m.content.slice(0, 200)}`).join("\n")}`,
             session_id: useChatStore.getState().activeSessionId,
@@ -524,75 +795,51 @@ export function ChatArea({ leftOpen, rightOpen, onToggleLeft, onToggleRight }: {
       } catch { /* non-critical */ }
     }
 
-    const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+    const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "";
     const aid = generateId();
     const uid = generateId();
     streamingMsgId.current = aid;
     addMessage({ id: uid, role: "user", content: text, timestamp: Date.now() });
     addMessage({ id: aid, role: "assistant", content: "", timestamp: Date.now(), isStreaming: true });
     setStreaming(aid, true);
+    clearToolCallEvents();
 
     try {
-      // ── Step 1: 意图分类 ──────────────────────────
-      const clsResp = await fetch(`${API_BASE}/classify`, {
+      // ── 单一统一流式端点，意图分类在服务端完成 ────────────────
+      const resp = await fetch(`${API_BASE}/chat/stream`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_input: text, has_active_selection: hasActiveSelection, accumulated_input: accumulatedInput, thinking_depth: getThinkingDepth(), session_id: useChatStore.getState().activeSessionId }),
+        headers: getApiHeaders(),
+        body: JSON.stringify({
+          user_input: text,
+          thinking_depth: thinkingDepth,
+          session_id: useChatStore.getState().activeSessionId,
+          accumulated_input: accumulatedInput || null,
+          has_active_selection: hasActiveSelection,
+        }),
       });
-      const cls = await clsResp.json();
-      const intent: string = cls.intent || "chat";
-      setCurrentIntent(intent as "selection" | "chat" | "adjustment" | "clarify");
-
-      // ── Step 2: 按意图路由 ─────────────────────────
-      if (intent === "clarify") {
-        // 约束不完整 → 显示追问，累积上下文
-        const clarifyText = cls.clarify_response || "请提供更完整的器件参数信息。";
-        setAccumulatedInput(prev => prev ? `${prev}; ${text}` : text);
-        updateMessage(aid, { content: clarifyText, isStreaming: false });
-        setStreaming(aid, false);
-        // 同时发送到 agent 保存会话上下文（fire-and-forget）
-        fetch(`${API_BASE}/agent/chat`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ user_input: text, session_id: useChatStore.getState().activeSessionId }),
-        }).catch(() => {});
-        setLoading(false);
-        setCurrentIntent(null);
-        streamingMsgId.current = null;
-        return;
-      }
-
-      if (intent === "selection" || intent === "adjustment") {
-        // 选型 or 调整 → 合并累积上下文后触发完整流水线
-        const adjMsg = intent === "adjustment" ? "检测到调整意图，重新选型中...\n\n" : "";
-        updateMessage(aid, { content: adjMsg });
-
-        // 合并累积的约束上下文（优先用后端 merged_input）
-        let fetchInput = cls.merged_input || (accumulatedInput ? `${accumulatedInput}; ${text}` : text);
-        setAccumulatedInput("");  // 选型触发后清空累积
-        if (intent === "adjustment" && cls.adjustments) {
-          fetchInput = text;
-        }
-
-        const resp = await fetch(`${API_BASE}/analyze/stream`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ user_input: fetchInput, thinking_depth: getThinkingDepth(), session_id: useChatStore.getState().activeSessionId }),
-        });
-        await consumeSelectionStream(aid, resp);
-
-      } else {
-        // 纯对话 → ReAct Agent
-        updateMessage(aid, { content: "" });
-        const resp = await fetch(`${API_BASE}/agent/chat/stream`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ user_input: text, thinking_depth: getThinkingDepth(), session_id: useChatStore.getState().activeSessionId }),
-        });
-        await consumeChatStream(aid, resp);
-      }
-
+      await consumeUnifiedStream(aid, resp, text);
       setStreaming(aid, false);
+
+      // ── 语义选择检测（LLM 兜底，非关键路径）──────────────────
+      if (session) {
+        const _API = process.env.NEXT_PUBLIC_API_BASE || "";
+        fetch(`${_API}/interpret-selection`, {
+          method: "POST",
+          headers: getApiHeaders(),
+          body: JSON.stringify({ session_id: session.id, user_input: text }),
+        })
+          .then(r => r.json())
+          .then(data => {
+            if (data.selected) {
+              fetch(`${_API}/select-part`, {
+                method: "POST",
+                headers: getApiHeaders(),
+                body: JSON.stringify({ session_id: session.id, part_number: data.selected }),
+              }).catch(() => {});
+            }
+          })
+          .catch(() => {});
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Unknown error";
       updateMessage(aid, { content: `> 连接失败: ${msg}`, isStreaming: false });
@@ -605,51 +852,26 @@ export function ChatArea({ leftOpen, rightOpen, onToggleLeft, onToggleRight }: {
   }, [input, loading, session, accumulatedInput, setAccumulatedInput, addMessage, updateMessage, setStreaming, setSessionTitle, handleCmd, hasActiveSelection]);
 
   return (
-    <main className="flex-1 flex flex-col min-w-0 bg-white">
-      {/* Toolbar — sidebar toggles + token budget */}
-      <div className="flex items-center justify-between px-3 py-1.5 border-b border-gray-100 bg-gray-50">
+    <main className="flex-1 flex flex-col min-w-0 bg-ez-bg">
+      {/* Toolbar */}
+      <div className="flex items-center justify-between px-3 h-10 md:h-9 border-b border-ez-border bg-ez-bg-header flex-shrink-0 gap-2">
         <div className="flex items-center gap-2">
-          <button onClick={onToggleLeft} className="p-1 rounded hover:bg-gray-200 transition-colors" title={leftOpen ? "收起侧栏" : "展开侧栏"}>
-            {leftOpen ? <PanelLeftClose className="w-4 h-4 text-gray-500" /> : <PanelLeftOpen className="w-4 h-4 text-gray-500" />}
+          <button onClick={onToggleLeft} className="btn-tool focus-ring" title={leftOpen ? "收起侧栏" : "展开侧栏"}>
+            {leftOpen ? <PanelLeftClose className="w-3.5 h-3.5" /> : <PanelLeftOpen className="w-3.5 h-3.5" />}
           </button>
-          <span className="text-[10px] text-gray-400 select-none">eZmanbo</span>
           {(() => {
             const msgs = (session?.messages || []).map(m => ({ role: m.role, content: m.content }));
             const tokens = estimateConversationTokens(msgs);
             return (
-              <span className={`text-[9px] font-mono ${tokens > COMPACT_THRESHOLD ? 'text-amber-600' : 'text-gray-400'}`}>
+              <span className={`text-2xs font-mono hidden sm:inline ${tokens > COMPACT_THRESHOLD ? 'text-ez-amber' : 'text-ez-text-dim'}`}>
                 ~{tokens}t
               </span>
             );
           })()}
         </div>
-        <div className="flex items-center gap-2">
-          {/* Health indicator */}
-          <span
-            className="inline-flex items-center gap-1"
-            title={
-              healthStatus === "connected"
-                ? "服务已连接"
-                : healthStatus === "disconnected"
-                ? "后端服务未连接，请确认已启动 Python 服务"
-                : "正在检查连接状态..."
-            }
-          >
-            <span
-              className={`w-2 h-2 rounded-full shrink-0 ${
-                healthStatus === "connected"
-                  ? "bg-green-500"
-                  : healthStatus === "disconnected"
-                  ? "bg-red-500"
-                  : "bg-yellow-400 animate-pulse"
-              }`}
-            />
-            {healthStatus === "disconnected" && (
-              <span className="text-[9px] text-red-400 hidden sm:inline">离线</span>
-            )}
-          </span>
-          <button onClick={onToggleRight} className="p-1 rounded hover:bg-gray-200 transition-colors" title={rightOpen ? "收起面板" : "展开面板"}>
-            {rightOpen ? <PanelRightClose className="w-4 h-4 text-gray-500" /> : <PanelRightOpen className="w-4 h-4 text-gray-500" />}
+        <div className="flex items-center gap-1.5">
+          <button onClick={onToggleRight} className="btn-tool focus-ring hidden lg:inline-flex" title={rightOpen ? "收起面板" : "展开面板"}>
+            {rightOpen ? <PanelRightClose className="w-3.5 h-3.5" /> : <PanelRightOpen className="w-3.5 h-3.5" />}
           </button>
         </div>
       </div>
@@ -659,86 +881,125 @@ export function ChatArea({ leftOpen, rightOpen, onToggleLeft, onToggleRight }: {
         {session?.messages.map((m) => (
           <div key={m.id}>
             <MessageBubble message={m} progress={m.id === streamingMsgId.current ? progress : undefined} />
-            {m.report && !m.isStreaming && m.id === session.messages.filter((x) => x.role === "assistant" && x.report).pop()?.id && (
+            {m.report && !m.isStreaming && m.id === session.messages.filter((x) => x.role === "assistant" && x.report).pop()?.id && (() => {
+              const isSelected = useChatStore.getState().selectedPartNumber;
+              return (
               <div className="ml-11 mt-2 animate-fade-in">
-                {activeReport && <PdfReportViewer reportType={activeReport} />}
+                {isSelected && (
+                  <div className="p-3 border border-ez-border-hi bg-ez-bg-panel animate-fade-in">
+                    <p className="text-xs text-ez-text font-medium mb-1.5 font-mono">
+                      ✓ SELECTED: <span className="text-ez-accent">{isSelected}</span>
+                    </p>
+                    <p className="text-2xs text-ez-text-muted mb-3 uppercase tracking-wide">Export reports?</p>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => {
+                          const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "";
+                          fetch(`${API_BASE}/export/bom?session_id=${session.id}`, { method: "POST", headers: getAuthBearer() })
+                            .then(r => r.blob())
+                            .then(blob => { const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = "BOM.xlsx"; a.click(); URL.revokeObjectURL(url); })
+                            .catch(() => {});
+                        }}
+                        className="btn-tool text-2xs uppercase tracking-wider h-7 px-3 text-ez-green border-ez-green/40 hover:bg-ez-green/10"
+                      >
+                        导出 BOM（xlsx）
+                      </button>
+                      <button
+                        onClick={() => {
+                          const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "";
+                          fetch(`${API_BASE}/report/risk?session_id=${session.id}`, { headers: getAuthBearer() })
+                            .then(r => r.json())
+                            .then(data => {
+                              const blob = new Blob([data.content || data], { type: "text/markdown" });
+                              const url = URL.createObjectURL(blob); const a = document.createElement("a");
+                              a.href = url; a.download = `风险评估_${isSelected}.md`; a.click();
+                              URL.revokeObjectURL(url);
+                            })
+                            .catch(() => {});
+                        }}
+                        className="text-xs px-3 py-1.5 bg-white text-gray-700 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors"
+                      >
+                        导出风险评估
+                      </button>
+                      <button
+                        onClick={() => {
+                          const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "";
+                          fetch(`${API_BASE}/export/decision-package?session_id=${session.id}`, { method: "POST", headers: getAuthBearer() })
+                            .then(r => r.blob())
+                            .then(blob => { const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = `选型决策包_${isSelected}.xlsx`; a.click(); URL.revokeObjectURL(url); })
+                            .catch(() => {});
+                        }}
+                        className="text-xs px-3 py-1.5 bg-brand-50 text-brand-700 border border-brand-200 rounded-lg hover:bg-brand-100 transition-colors font-medium"
+                      >
+                        导出决策包（IATF）
+                      </button>
+                      <button
+                        onClick={() => useChatStore.getState().setSelectedPart(null)}
+                        className="btn-tool text-2xs uppercase tracking-wider h-7 px-3 text-ez-text-muted"
+                      >
+                        取消
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
-            )}
+              );
+            })()}
           </div>
         ))}
         <div ref={bottomRef} />
       </div>
 
       {/* Input */}
-      <div className="border-t border-gray-200 p-4 bg-white relative">
+      <div className="border-t border-ez-border p-3 bg-ez-bg-panel relative flex-shrink-0">
         {/* Slash command menu */}
         {showCmdMenu && (
-          <div className="absolute bottom-full left-0 right-0 mx-4 mb-2 p-2 bg-white border border-gray-200 rounded-xl shadow-xl z-50 animate-fade-in">
+          <div className="absolute bottom-full left-0 right-0 mx-3 mb-1 py-1 bg-ez-bg-panel border border-ez-border-hi shadow-xl z-50 animate-fade-in">
             {Object.entries(SLASH_COMMANDS)
               .filter(([k]) => k.startsWith(input.slice(1).split(" ")[0].toLowerCase()))
               .map(([k, v]) => (
-                <button key={k} onClick={() => handleCmd(k)} className="w-full flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-brand-50 text-sm transition-colors">
-                  <Slash className="w-4 h-4 text-brand-500" />
-                  <span className="font-mono text-brand-700">/{k}</span>
-                  <span className="text-gray-500 text-xs ml-auto">{v.desc}</span>
+                <button key={k} onClick={() => handleCmd(k)} className="w-full flex items-center gap-3 px-3 h-8 hover:bg-ez-bg-hover transition-colors">
+                  <Slash className="w-3 h-3 text-ez-accent" />
+                  <span className="font-mono text-xs text-ez-accent">/{k}</span>
+                  <span className="text-ez-text-muted text-2xs ml-auto">{v.desc}</span>
                 </button>
               ))}
           </div>
         )}
 
-        {/* Thinking popover */}
-        {showThinking && (
-          <div className="absolute bottom-full left-16 mb-2 w-64 bg-white border border-gray-200 rounded-xl shadow-xl z-50 p-3 animate-fade-in">
-            <ThinkingDepthPanel />
-          </div>
-        )}
-        {/* Upload popover */}
-        {showUpload && (
-          <div className="absolute bottom-full left-28 mb-2 w-72 bg-white border border-gray-200 rounded-xl shadow-xl z-50 p-3 animate-fade-in">
-            <FileUpload />
-          </div>
-        )}
-
-        {/* Action buttons row */}
-        <div className="max-w-3xl mx-auto flex items-center gap-1.5 mb-2">
-          <QuickPhrases onSelect={handleQuickPhrase} />
-          <button
-            onClick={() => { setShowThinking(!showThinking); setShowUpload(false); }}
-            className={`flex items-center gap-1 px-2 py-1 rounded-full text-[10px] transition-colors ${showThinking ? "bg-purple-100 text-purple-700" : "bg-gray-100 text-gray-600 hover:bg-purple-50 hover:text-purple-600"}`}
-          >
-            <Brain className="w-3 h-3" /> 思考
-          </button>
-          <button
-            onClick={() => { setShowUpload(!showUpload); setShowThinking(false); }}
-            className={`flex items-center gap-1 px-2 py-1 rounded-full text-[10px] transition-colors ${showUpload ? "bg-blue-100 text-blue-700" : "bg-gray-100 text-gray-600 hover:bg-blue-50 hover:text-blue-600"}`}
-          >
-            <Upload className="w-3 h-3" /> 上传
-          </button>
-        </div>
-
         {/* Text input */}
-        <div className="max-w-3xl mx-auto flex gap-3 items-end">
-          <textarea
-            ref={textareaRef}
-            value={input}
-            onChange={(e) => handleInputChange(e.target.value)}
-            onKeyDown={handleKeyDownIntercept}
-            placeholder="输入选型需求，或输入 / 查看命令..."
-            rows={2}
-            className="flex-1 resize-none rounded-xl border border-gray-300 px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-brand-400 focus:border-transparent placeholder:text-gray-400"
-            disabled={loading}
-          />
-          <button
-            onClick={handleSend}
-            disabled={loading || !input.trim()}
-            className="shrink-0 w-10 h-10 rounded-xl bg-brand-700 text-white flex items-center justify-center hover:bg-brand-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-          >
-            {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5" />}
-          </button>
+        <div className="max-w-3xl mx-auto w-full">
+          <div className={cn(
+            "bg-white rounded-2xl border border-ez-border shadow-sm overflow-hidden transition-all duration-150",
+            loading ? "opacity-70" : "hover:shadow focus-within:shadow focus-within:border-ez-border-hi"
+          )}>
+            <textarea
+              ref={textareaRef}
+              value={input}
+              onChange={(e) => handleInputChange(e.target.value)}
+              onKeyDown={handleKeyDownIntercept}
+              placeholder="描述选型需求，如「12V转5V，2A，工业级」…"
+              rows={3}
+              className="w-full resize-none bg-transparent px-4 pt-4 pb-2 text-sm text-ez-text placeholder:text-ez-text-dim focus:outline-none leading-relaxed"
+              disabled={loading}
+            />
+            <div className="flex items-center justify-between px-4 pb-3 pt-0.5">
+              <span className="text-2xs text-ez-text-label hidden md:block">Enter 发送 · Shift+Enter 换行 · / 命令</span>
+              <button
+                onClick={() => handleSend()}
+                disabled={loading || !input.trim()}
+                className={cn(
+                  "ml-auto w-8 h-8 rounded-xl flex items-center justify-center transition-all",
+                  input.trim() && !loading
+                    ? "bg-ez-accent hover:bg-ez-accent-hi text-white shadow-sm"
+                    : "bg-ez-bg-surface text-ez-text-dim cursor-not-allowed"
+                )}
+              >
+                {loading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+              </button>
+            </div>
+          </div>
         </div>
-        <p className="text-[10px] text-gray-400 text-center mt-2">
-          Enter 发送 · Shift+Enter 换行 · 输入 / 使用命令
-        </p>
       </div>
     </main>
   );

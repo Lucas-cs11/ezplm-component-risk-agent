@@ -39,7 +39,7 @@ def _query_rag_knowledge(user_input: str, req: RequirementConstraints) -> List[D
         return []
 
 
-def analyze(user_input: str) -> SelectionReport:
+def analyze(user_input: str, thinking_depth: str = "default") -> SelectionReport:
     # ── B4：语义缓存层检查（ParseNode 前置）──────────────────────
     from .semantic_cache import get_semantic_cache
     cache = get_semantic_cache()
@@ -85,7 +85,8 @@ def analyze(user_input: str) -> SelectionReport:
 
     # ── 参考设计获取（仅 EZ-PLM API 器件，LLM key 存在时）────────
     ref_designs_map = {}
-    if os.getenv("OPENAI_API_KEY", "").strip():
+    from .llm_config import get_api_key
+    if get_api_key().strip():
         api_parts = [c for c in candidates if getattr(c, "source", "") == "ezplm"][:10]
         for p in api_parts:
             if p.ezplm_part_id:

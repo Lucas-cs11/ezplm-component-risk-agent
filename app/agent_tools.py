@@ -282,4 +282,4 @@ AGENT_TOOLS = [
 # 按池分类
 SELECTION_TOOLS = [search_components, query_design_knowledge, generate_full_report]
 REPLACEMENT_TOOLS = [search_components, find_alternative_parts]  # 替代也需要搜索
-CHAT_TOOLS = [query_design_knowledge]  # 对话模式仅保留知识检索
+CHAT_TOOLS = [query_design_knowledge, search_components]  # 对话模式：知识检索 + 参数收集完成后可直接搜索

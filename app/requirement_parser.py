@@ -98,7 +98,8 @@ def parse_requirement(text: str) -> RequirementConstraints:
     lower = text.lower()
 
     # ── LLM 优先解析（Function Calling → 旧版 fallback）────────
-    if os.getenv("OPENAI_API_KEY"):
+    from .llm_config import get_api_key
+    if get_api_key():
         llm_res = {}
         # 优先使用 Function Calling（P2）
         if parse_requirement_with_fc is not None:

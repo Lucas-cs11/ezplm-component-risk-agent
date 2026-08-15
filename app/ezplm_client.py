@@ -30,6 +30,7 @@ import json
 import os
 import re as _re
 import time
+import threading
 import uuid
 import hmac
 import hashlib
@@ -53,10 +54,36 @@ _BASE_URL: str = os.getenv("EZPLM_BASE_URL", "https://www.ezplm.cn").rstrip("/")
 _API_KEY: str = os.getenv("EZPLM_API_KEY", "").strip()
 
 _API_MAX_PER_KW: int = 50      # 每关键词最多返回条数（pageSize）
-_API_MAX_TOTAL: int = 150      # 单次 search_parts 最多累计匹配条数
-_API_MAX_CALLS: int = 12       # 单次 search_parts 最多新 API 请求数（防超限）
+_API_MAX_TOTAL: int = 80       # 单次 search_parts 最多累计匹配条数
+_API_MAX_CALLS: int = 10       # 单次 search_parts 最多新 API 请求数（防超限）
 _API_DELAY_S: float = 0.25    # 关键词请求间隔（秒），避免触发 429
 _API_TIMEOUT_S: int = 20       # 单次 HTTP 超时
+
+
+# P2-4: 令牌桶速率限制器（线程安全），取代 time.sleep(_API_DELAY_S)
+class _TokenBucket:
+    """Thread-safe token bucket: allows burst then enforces steady-state rate."""
+    def __init__(self, rate: float, burst: int = 4):
+        self._rate = rate          # tokens refilled per second
+        self._burst = float(burst)
+        self._tokens = float(burst)
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            self._tokens = min(self._burst, self._tokens + (now - self._last) * self._rate)
+            self._last = now
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+            else:
+                wait = (1.0 - self._tokens) / self._rate
+                self._tokens = 0.0
+                time.sleep(wait)
+
+
+_api_rate_limiter = _TokenBucket(rate=1.0 / _API_DELAY_S, burst=4)
 
 # ═══════════════════════════════════════════════════════════════════
 # 24h in-memory 关键词缓存（keyword → (expire_ts, [raw_dict, ...])）
@@ -172,6 +199,18 @@ _MPN_TOPO_MAP: List[Tuple[str, str]] = sorted([
 ], key=lambda x: -len(x[0]))   # 长前缀优先
 
 _MPN_CAT_MAP: List[Tuple[str, str]] = sorted([
+    # Op-Amps
+    ("OPA", "op_amp"), ("OPA2", "op_amp"), ("OPA4", "op_amp"),
+    ("AD8", "op_amp"), ("ADA", "op_amp"), ("AD623", "op_amp"),
+    ("MCP60", "op_amp"),
+    # Instrumentation Amps
+    ("INA12", "instrumentation_amp"), ("INA82", "instrumentation_amp"),
+    ("AD823", "instrumentation_amp"), ("LT116", "instrumentation_amp"),
+    # Current Sense
+    ("INA2", "current_sense"),
+    # Interface
+    ("SN65", "interface_ic"), ("SN75", "interface_ic"),
+    ("ADM4", "interface_ic"), ("ADM2", "interface_ic"),
     # DC-DC
     ("TPS5", "dc_dc_converter"), ("TPS6", "dc_dc_converter"),
     ("LM259", "dc_dc_converter"), ("LM257", "dc_dc_converter"),
@@ -315,6 +354,35 @@ _API_KEYWORDS: Dict[str, Dict[Optional[str], List[str]]] = {
             "LD1117", "LD39020", "L7805", "L7812", "LDL112",
         ],
     },
+    # ── 扩展分类（运放 / 电流检测 / 接口IC）─────────────────────
+    "op_amp": {
+        None: [
+            "OPA", "OPA2", "OPA4",               # TI 通用/精密运放
+            "AD8", "ADA", "AD623", "AD620",       # ADI 运放
+            "LT606", "LT607",                     # ADI/LTC
+            "MCP600", "MCP601", "MCP602", "MCP604", # Microchip
+        ]
+    },
+    "instrumentation_amp": {
+        None: [
+            "INA128", "INA129", "INA821", "INA826",  # TI 精密仪表放大器
+            "AD8221", "AD8237", "AD620", "AD623",     # ADI
+            "LT1167", "LT1168",                       # ADI/LTC
+        ]
+    },
+    "current_sense": {
+        None: [
+            "INA219", "INA220", "INA226", "INA228", "INA230",  # TI 功率/电流监控
+            "INA2",                                             # TI INA2xx 电流检测
+        ]
+    },
+    "interface_ic": {
+        None: [
+            "SN65HVD",                    # TI CAN 收发器
+            "SN75176", "SN75ALS",         # TI RS-422/485
+            "ADM485", "ADM2587", "ADM",   # ADI RS-485
+        ]
+    },
 }
 
 # 厂商前缀白名单（用于厂商偏好过滤）
@@ -353,14 +421,31 @@ def _canonical_query(params: Dict[str, Any]) -> str:
     )
 
 
+def _get_api_key() -> str:
+    """动态读取 API 密钥：优先 env var，其次 DB（支持运行时管理员配置生效）。"""
+    key = os.getenv("EZPLM_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        from .database import SessionLocal
+        from .models_db import AdminConfig
+        _db = SessionLocal()
+        cfg = _db.query(AdminConfig).first()
+        _db.close()
+        return (cfg.ezplm_api_key or "").strip() if cfg else ""
+    except Exception:
+        return ""
+
+
 def _build_signature(method: str, path: str, params: Dict[str, Any],
                      timestamp: str, nonce: str) -> str:
     """计算 HMAC-SHA256 签名，base64url 编码，去掉末尾 =。"""
+    api_key = _get_api_key()
     canonical = "\n".join([
         method.upper(), path, _canonical_query(params), timestamp, nonce
     ])
     digest = hmac.new(
-        _API_KEY.encode("utf-8"),
+        api_key.encode("utf-8"),
         canonical.encode("utf-8"),
         hashlib.sha256,
     ).digest()
@@ -369,7 +454,8 @@ def _build_signature(method: str, path: str, params: Dict[str, Any],
 
 def _request_json(path: str, params: Dict[str, Any]) -> Tuple[int, Dict]:
     """发起一次 eZ-PLM API GET 请求（含签名），返回 (status_code, body_dict)。"""
-    if not _API_KEY:
+    api_key = _get_api_key()
+    if not api_key:
         return 0, {"error": "EZPLM_API_KEY 未配置"}
     timestamp = str(int(time.time()))
     nonce = str(uuid.uuid4())
@@ -377,7 +463,7 @@ def _request_json(path: str, params: Dict[str, Any]) -> Tuple[int, Dict]:
     query_str = _canonical_query(params)
     url = _BASE_URL + path + (f"?{query_str}" if query_str else "")
     req = urllib.request.Request(url, method="GET", headers={
-        "X-API-Key":   _API_KEY,
+        "X-API-Key":   api_key,
         "X-Timestamp": timestamp,
         "X-Nonce":     nonce,
         "X-Signature": signature,
@@ -764,6 +850,14 @@ def _map_api_part(api_obj: Dict) -> Optional[PartIR]:
             "quiescent_current_ua":    attrs.get("quiescent_current_ua"),
             "efficiency_pct":          attrs.get("efficiency_pct"),
             "features":                features,
+            "footprint_file": (
+                _extract_package_name(api_obj.get("footprint"))
+                if api_obj.get("footprint") else None
+            ),
+            "symbol_file": (
+                _extract_package_name(api_obj.get("symbol"))
+                if api_obj.get("symbol") else None
+            ),
         })
 
         # 记录到 known MPNs（供幻觉检测使用，LRU 有序集合）
@@ -897,8 +991,8 @@ def search_parts(
     · 429 时降级使用过期缓存，保证可用性
     · EZPLM_API_KEY 未配置时返回空列表
     """
-    if not _API_KEY:
-        logger.warning("EZPLM_API_KEY 未配置，无法查询 eZ-PLM 器件数据。请在 .env 中设置。")
+    if not _get_api_key():
+        logger.warning("EZPLM_API_KEY 未配置，无法查询 eZ-PLM 器件数据。请在管理员设置中配置。")
         return []
 
     keywords = _generate_keywords(constraints)
@@ -923,7 +1017,7 @@ def search_parts(
                 logger.info(f"已达 {_API_MAX_CALLS} 次新 API 请求上限，停止继续搜索")
                 break
             if new_api_calls > 0:
-                time.sleep(_API_DELAY_S)   # 避免连续请求触发限速
+                _api_rate_limiter.acquire()   # P2-4: token bucket (was: time.sleep)
             new_api_calls += 1
 
         raw_items, _ = _search_keyword(kw)
@@ -949,7 +1043,7 @@ def find_replacements(part_number: str) -> List[PartIR]:
     为指定型号查找同类替代器件。
     推断原型号的 category/topology，在 eZ-PLM 中搜索同类器件（去除自身）。
     """
-    if not _API_KEY or not part_number:
+    if not _get_api_key() or not part_number:
         return []
     cat = _infer_category_from_mpn(part_number) or "dc_dc_converter"
     topo = _infer_topology_from_mpn(part_number)
@@ -966,7 +1060,7 @@ def fetch_reference_designs(part_id: str) -> List[Dict]:
     """
     根据 eZ-PLM 零件 ID 获取关联参考设计（需要先通过 search_parts 得到 ezplm_part_id）。
     """
-    if not _API_KEY or not part_id:
+    if not _get_api_key() or not part_id:
         return []
     status, body = _request_json(
         "/api/v1/api-key/reference-designs",
@@ -999,7 +1093,7 @@ def search_part_by_mpn(mpn: str) -> Optional[PartIR]:
 
     注：同样享受 24h 关键词缓存。
     """
-    if not _API_KEY or not mpn:
+    if not _get_api_key() or not mpn:
         return None
     results, _ = _search_keyword(mpn.strip())
     # 优先返回 MPN 完全匹配的条目
@@ -1033,7 +1127,7 @@ def fetch_part_detail(part_id: str) -> Optional[PartIR]:
     · 结果缓存 24h（同一 part_id 不重复请求）
     · 端点不存在时（404/405）静默退出，不影响主流程
     """
-    if not _API_KEY or not part_id:
+    if not _get_api_key() or not part_id:
         return None
 
     now = time.time()
@@ -1082,7 +1176,7 @@ def enrich_candidates_with_details(
 
     调用时机：score_candidates 之前，让评分能利用更丰富的参数。
     """
-    if not _API_KEY:
+    if not _get_api_key():
         return candidates
 
     enriched_count = 0
@@ -1094,7 +1188,7 @@ def enrich_candidates_with_details(
             continue
 
         if enriched_count > 0:
-            time.sleep(_API_DELAY_S)
+            _api_rate_limiter.acquire()   # P2-4: token bucket
 
         detail = fetch_part_detail(part.ezplm_part_id)
         enriched_count += 1
@@ -1133,6 +1227,10 @@ def enrich_candidates_with_details(
             logger.warning(f"enrich_candidates: PartIR 重建失败 {part.part_number}: {e}")
             enriched = part  # 合并失败则保持原样
 
+        # ⑥ 数据手册参数补充（仅在关键字段仍缺失时触发）
+        if not enriched.switching_frequency_khz or not enriched.output_current_max_a:
+            enriched = enrich_part_from_datasheet(enriched)
+
         result.append(enriched)
         logger.debug(
             f"enrich: {part.part_number} — "
@@ -1151,3 +1249,111 @@ def enrich_candidates_with_details(
 def get_known_mpns() -> set:
     """返回当前会话中从 eZ-PLM API 获取到的所有已知 MPN 集合（供幻觉检测用）。"""
     return frozenset(_KNOWN_MPNS.keys())
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ⑥ 数据手册 PDF 参数深化提取（补充 eZ-PLM attributes 缺失字段）
+# ═══════════════════════════════════════════════════════════════════
+
+_DS_CACHE: dict = {}   # url → (expire_ts, params_dict)
+_DS_CACHE_MAX = 200
+
+
+def _extract_params_from_pdf_text(text: str, part: "PartIR") -> dict:
+    """从数据手册文本中提取缺失的关键电气参数（正则 + 单位换算）。"""
+    params: dict = {}
+    t = text[:30000]  # 仅扫描前30k字符，足覆盖摘要页
+
+    if getattr(part, "input_voltage_max_v", None) is None:
+        m = _re.search(r"V_?IN\s*[\(（]?max[\)）]?\s*[=:\.]\s*(\d+(?:\.\d+)?)\s*V", t, _re.I)
+        if m:
+            params["input_voltage_max_v"] = float(m.group(1))
+
+    if getattr(part, "output_voltage_v", None) is None:
+        m = _re.search(r"V_?OUT\s*[=:\.]\s*(\d+(?:\.\d+)?)\s*V", t, _re.I)
+        if m:
+            val = float(m.group(1))
+            if 0.5 <= val <= 60:
+                params["output_voltage_v"] = val
+
+    if getattr(part, "output_current_max_a", None) is None:
+        m = _re.search(r"I_?OUT\s*[\(（]?max[\)）]?\s*[=:\.]\s*(\d+(?:\.\d+)?)\s*(A|mA)", t, _re.I)
+        if m:
+            val = float(m.group(1))
+            if m.group(2).upper() == "MA":
+                val /= 1000
+            if 0.001 <= val <= 100:
+                params["output_current_max_a"] = val
+
+    if getattr(part, "switching_frequency_khz", None) is None:
+        m = _re.search(r"f_?SW\s*[=:\.]\s*(\d+(?:\.\d+)?)\s*(MHz|kHz)", t, _re.I)
+        if m:
+            val = float(m.group(1))
+            if "MHz" in m.group(2):
+                val *= 1000
+            if 10 <= val <= 10000:
+                params["switching_frequency_khz"] = val
+
+    if getattr(part, "efficiency_pct", None) is None:
+        m = _re.search(r"efficiency[^\n]{0,30}?(\d{2,3}(?:\.\d+)?)\s*%", t, _re.I)
+        if m:
+            val = float(m.group(1))
+            if 50 <= val <= 100:
+                params["efficiency_pct"] = val
+
+    return params
+
+
+def enrich_part_from_datasheet(part: "PartIR") -> "PartIR":
+    """
+    下载器件数据手册 PDF 并提取缺失电气参数，补充 PartIR。
+    - 24h URL 缓存，避免重复下载
+    - 超时/网络失败静默跳过，不影响主流程
+    """
+    if not getattr(part, "datasheet_url", None):
+        return part
+
+    url = part.datasheet_url
+    now = time.time()
+    cached = _DS_CACHE.get(url)
+    if cached and now < cached[0]:
+        params = cached[1]
+    else:
+        try:
+            import urllib.request as _ur, tempfile as _tmp, os as _os
+            try:
+                import fitz as _fitz
+            except ImportError:
+                return part  # PyMuPDF 未安装则跳过
+
+            req = _ur.Request(url, headers={"User-Agent": "Mozilla/5.0 (eZmanbo datasheet-fetcher)"})
+            with _ur.urlopen(req, timeout=12) as resp:
+                pdf_bytes = resp.read(5 * 1024 * 1024)   # 最多5 MB
+
+            with _tmp.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+                f.write(pdf_bytes)
+                tmp_path = f.name
+            try:
+                doc = _fitz.open(tmp_path)
+                text = "\n".join(doc[i].get_text() for i in range(min(10, len(doc))))
+                doc.close()
+            finally:
+                _os.unlink(tmp_path)
+
+            params = _extract_params_from_pdf_text(text, part)
+            _DS_CACHE[url] = (now + _KW_CACHE_TTL, params)
+            if len(_DS_CACHE) > _DS_CACHE_MAX:
+                del _DS_CACHE[next(iter(_DS_CACHE))]
+        except Exception as exc:
+            logger.debug(f"datasheet enrichment failed for {part.part_number}: {exc}")
+            return part
+
+    if not params:
+        return part
+
+    # 将提取到的参数合并回 PartIR（不覆盖已有值）
+    try:
+        updated = {**part.dict(), **{k: v for k, v in params.items() if part.dict().get(k) is None}}
+        return PartIR.parse_obj(updated)
+    except Exception:
+        return part

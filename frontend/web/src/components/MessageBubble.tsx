@@ -3,43 +3,50 @@
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import Image from "next/image";
-import { ChevronDown, ChevronRight, Brain } from "lucide-react";
-import { cn, formatElapsed, LLM_MODEL } from "@/lib/utils";
-import { ReportCard } from "@/components/ReportCard";
-import { SchematicPanel } from "@/components/SchematicPanel";
+import { Sparkles, User, ChevronDown } from "lucide-react";
+import { cn, formatElapsed } from "@/lib/utils";
+import { ParameterForm } from "@/components/ParameterForm";
+import { useChatStore } from "@/store/chat";
 import type { ChatMessage } from "@/types";
 
 interface ProgInfo { current: number; total: number; pct: number; }
 
-/* ── 思考过程折叠块 ──────────────────────────────────────────── */
-function ThinkingBlock({ content, isStreaming }: { content: string; isStreaming?: boolean }) {
+function SparkleLoader() {
+  return (
+    <div className="flex items-center gap-1.5 py-2 px-1">
+      {[0, 160, 320].map((delay) => (
+        <div key={delay}
+          className="w-2 h-2 rounded-full bg-teal-500"
+          style={{ animation: "pulseDot 1.4s ease-in-out infinite", animationDelay: `${delay}ms` }}
+        />
+      ))}
+    </div>
+  );
+}
+
+function ThinkingFade({ content, isStreaming }: { content: string; isStreaming?: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const lines = content.trim().split("\n").filter(Boolean);
   if (!lines.length) return null;
-
   return (
-    <div className="mb-3 border border-purple-100 rounded-xl overflow-hidden bg-purple-50/40">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-1.5 px-3 py-2 text-left hover:bg-purple-50/60 transition-colors"
-      >
-        <Brain className={cn("w-3 h-3 shrink-0", isStreaming && !expanded ? "text-purple-400 animate-pulse" : "text-purple-400")} />
-        <span className="text-[10px] text-purple-600 font-medium flex-1">
-          思考过程
-          {isStreaming && <span className="ml-1 text-purple-400">（推理中…）</span>}
-          {!isStreaming && <span className="ml-1 text-purple-400">({lines.length} 步)</span>}
+    <div className="mb-3">
+      <button onClick={() => setExpanded(!expanded)}
+        className="flex items-center gap-1.5 text-slate-400 hover:text-slate-600 mb-1 transition-colors">
+        <div className={cn("w-1.5 h-1.5 rounded-full bg-teal-400/60", isStreaming && "animate-pulse")} />
+        <span className="text-2xs font-medium uppercase tracking-widest">
+          {isStreaming ? "推理中…" : `推理过程（${lines.length} 步）`}
         </span>
-        {expanded
-          ? <ChevronDown className="w-3 h-3 text-purple-400 shrink-0" />
-          : <ChevronRight className="w-3 h-3 text-purple-400 shrink-0" />}
+        <ChevronDown className={cn("w-2.5 h-2.5 transition-transform", expanded && "rotate-180")} />
       </button>
+      {!expanded && isStreaming && lines.length > 0 && (
+        <p className="text-2xs text-ez-text-label/60 font-mono italic pl-3 truncate border-l border-ez-text-dim/20 think-line">
+          {lines[lines.length - 1]}
+        </p>
+      )}
       {expanded && (
-        <div className="px-3 pb-3 space-y-1 border-t border-purple-100">
+        <div className="pl-3 border-l border-ez-text-dim/20 max-h-28 overflow-y-auto space-y-0.5">
           {lines.map((line, i) => (
-            <p key={i} className="text-[10px] text-purple-700/80 leading-relaxed font-mono">
-              {line}
-            </p>
+            <p key={i} className="text-2xs text-ez-text-label/70 font-mono italic leading-relaxed think-line">{line}</p>
           ))}
         </div>
       )}
@@ -47,172 +54,88 @@ function ThinkingBlock({ content, isStreaming }: { content: string; isStreaming?
   );
 }
 
+function ParameterFormInline({ message }: { message: ChatMessage }) {
+  const { setPendingInput } = useChatStore();
+  return (
+    <ParameterForm
+      missingFields={message.missing_fields ?? []}
+      accumulated={(message.accumulated_constraints ?? {}) as Record<string, unknown>}
+      onSubmit={(text) => setPendingInput(text)}
+    />
+  );
+}
+
 export function MessageBubble({ message, progress }: { message: ChatMessage; progress?: ProgInfo }) {
   const isUser = message.role === "user";
-  const [showReport, setShowReport] = useState(false);
 
   return (
-    <div className={cn("flex gap-3 animate-slide-up", isUser ? "justify-end" : "justify-start")}>
-      {!isUser && (
-        <div className="w-8 h-8 rounded-full bg-brand-100 flex items-center justify-center overflow-hidden shrink-0 mt-1">
-          <Image src="/agent_avatar.jpeg" alt="Agent" width={32} height={32} className="w-8 h-8 object-cover" />
-        </div>
-      )}
+    <div className={cn("flex gap-2.5", isUser ? "flex-row-reverse msg-user" : "flex-row msg-assistant")}>
+      <div className="w-7 h-7 rounded-xl border border-slate-100 bg-white shadow-sm flex items-center justify-center shrink-0 mt-0.5">
+        {isUser ? <User className="w-3.5 h-3.5 text-slate-500" /> : <Sparkles className="w-3.5 h-3.5 text-teal-600" />}
+      </div>
 
-      <div className={cn("max-w-[72%]", isUser ? "order-first" : "")}>
-        <div
-          className={cn(
-            "rounded-2xl px-4 py-3 text-sm leading-relaxed",
-            isUser
-              ? "bg-brand-700 text-white rounded-br-md"
-              : "bg-surface-card border border-gray-200 rounded-bl-md shadow-sm"
-          )}
-        >
-          {isUser ? (
+      <div className={cn("flex flex-col", isUser ? "items-end max-w-[72%]" : "flex-1 min-w-0")}>
+        {isUser ? (
+          <div className="bg-white border border-slate-200 shadow-sm rounded-2xl rounded-tr-sm px-4 py-2.5 text-sm text-slate-800 leading-relaxed">
             <p className="whitespace-pre-wrap">{message.content}</p>
-          ) : message.content ? (
-            <div>
-              {message.isStreaming && (
-                <div className="mb-2">
-                  <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-brand-50 text-brand-600 font-medium">
-                    选型分析中
-                  </span>
-                </div>
-              )}
-              {!message.isStreaming && !message.report && message.content.length > 0 && (
-                <div className="mb-2">
-                  <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-gray-50 text-gray-500 font-medium">
-                    对话模式
-                  </span>
-                </div>
-              )}
-              {message.report && (
-                <div className="mb-2 flex items-center gap-2">
-                  <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-green-50 text-green-700 font-medium">
-                    选型完成
-                  </span>
-                  {message.report.risks?.overall_risk_level && (
-                    <span className={cn(
-                      "text-[9px] px-1.5 py-0.5 rounded-full font-medium",
-                      message.report.risks.overall_risk_level === "high"
-                        ? "bg-red-50 text-red-700"
-                        : message.report.risks.overall_risk_level === "medium"
-                          ? "bg-orange-50 text-orange-700"
-                          : "bg-green-50 text-green-700"
-                    )}>
-                      {message.report.risks.overall_risk_level === "high" ? "高风险" :
-                       message.report.risks.overall_risk_level === "medium" ? "中风险" : "低风险"}
-                    </span>
-                  )}
-                </div>
-              )}
-
-              {/* ── 思考过程折叠块（在正文上方）── */}
-              {message.thinking && (
-                <ThinkingBlock
-                  content={message.thinking}
-                  isStreaming={message.isStreaming && !message.thinkingDone}
-                />
-              )}
-
-              {progress && message.isStreaming && (
-                <div className="mb-3">
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="text-[10px] text-brand-600 font-medium">
-                      {progress.pct < 10 ? "解析需求" :
-                       progress.pct < 30 ? "检索器件库" :
-                       progress.pct < 60 ? `评分中 ${progress.current}/${progress.total}` :
-                       progress.pct < 80 ? "构建证据链" :
-                       progress.pct < 95 ? "风险评估" : "生成报告"}
-                    </span>
-                    <span className="text-[10px] text-brand-500 font-mono">{progress.pct}%</span>
+          </div>
+        ) : (
+          <div className="w-full">
+            {message.thinking && (
+              <ThinkingFade content={message.thinking} isStreaming={message.isStreaming && !message.thinkingDone} />
+            )}
+            {!message.content && message.isStreaming && (
+              <>
+                {progress && (
+                  <div className="mb-2">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-2xs font-mono text-slate-400 uppercase tracking-wide">
+                        {progress.pct < 15 ? "解析需求" : progress.pct < 30 ? "检索器件" :
+                         progress.pct < 60 ? `多维评分 ${progress.current}/${progress.total}` :
+                         progress.pct < 80 ? "生成证据" : progress.pct < 95 ? "风险评估" : "生成报告"}
+                      </span>
+                      <span className="text-2xs font-mono text-teal-600">{progress.pct}%</span>
+                    </div>
+                    <div className="stage-track"><div className="stage-fill" style={{ width: `${progress.pct}%` }} /></div>
                   </div>
-                  <div className="h-1.5 rounded-full bg-brand-100 overflow-hidden">
-                    <div
-                      className="h-full rounded-full bg-brand-500 transition-all duration-500 ease-out"
-                      style={{ width: `${progress.pct}%` }}
-                    />
+                )}
+                {!message.thinking && <SparkleLoader />}
+              </>
+            )}
+            {message.content && (
+              <div>
+                {progress && message.isStreaming && (
+                  <div className="mb-2">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-2xs font-mono text-slate-400 uppercase tracking-wide">
+                        {progress.pct < 60 ? `多维评分 ${progress.current}/${progress.total}` :
+                         progress.pct < 80 ? "生成证据" : progress.pct < 95 ? "风险评估" : "生成报告"}
+                      </span>
+                      <span className="text-2xs font-mono text-teal-600">{progress.pct}%</span>
+                    </div>
+                    <div className="stage-track"><div className="stage-fill" style={{ width: `${progress.pct}%` }} /></div>
                   </div>
+                )}
+                <div className={cn("markdown-body", message.isStreaming && !message.report && "typing-cursor")}>
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
                 </div>
-              )}
-
-              <div className={cn("markdown-body", message.isStreaming && "typing-cursor")}>
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                  {message.content}
-                </ReactMarkdown>
-              </div>
-
-              {!message.isStreaming && (
-                <div className="mt-2 pt-2 border-t border-gray-100">
-                  <span className="text-[9px] text-gray-400">{LLM_MODEL}</span>
-                </div>
-              )}
-            </div>
-          ) : (
-            <div>
-              {/* 仅有 thinking 尚无正文内容时，也展示思考块 */}
-              {message.thinking && (
-                <ThinkingBlock
-                  content={message.thinking}
-                  isStreaming={message.isStreaming && !message.thinkingDone}
-                />
-              )}
-              {progress ? (
-                <div className="mb-3">
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="text-[10px] text-brand-600 font-medium">初始化中</span>
-                    <span className="text-[10px] text-brand-500 font-mono">{progress.pct}%</span>
+                {!message.isStreaming && message.missing_fields?.length && (
+                  <ParameterFormInline message={message} />
+                )}
+                {!message.isStreaming && message.report && (
+                  <div className="mt-2 flex items-center gap-2 text-2xs text-slate-400">
+                    <span className="font-mono">{(message.report.candidates?.length || message.report.recommended_parts?.length || 0)} 个候选器件</span>
+                    <span className="text-slate-200">·</span>
+                    <span className="font-mono">{message.report.evidence_count || 0} 条证据</span>
+                    <span className="text-slate-200">·</span>
+                    <span className="font-mono">{formatElapsed(message.report.elapsed_s || 0)}</span>
                   </div>
-                  <div className="h-1.5 rounded-full bg-brand-100 overflow-hidden">
-                    <div className="h-full rounded-full bg-brand-500 transition-all duration-500 ease-out" style={{ width: `${progress.pct}%` }} />
-                  </div>
-                </div>
-              ) : null}
-              <div className="flex items-center gap-2 text-gray-400 text-xs">
-                <span className="w-2 h-2 rounded-full bg-brand-400 animate-pulse-dot" />
-                <span className="w-2 h-2 rounded-full bg-brand-400 animate-pulse-dot" style={{ animationDelay: "0.2s" }} />
-                <span className="w-2 h-2 rounded-full bg-brand-400 animate-pulse-dot" style={{ animationDelay: "0.4s" }} />
-              </div>
-            </div>
-          )}
-        </div>
-
-        {!isUser && message.report && !message.isStreaming && (
-          <div className="mt-2 space-y-2">
-            <div className="flex items-center gap-3 text-[11px] text-gray-500 px-1">
-              <span className="font-medium">已选 {message.report.recommended_parts?.length || 0} 款</span>
-              <span>证据 {message.report.evidence_count || 0} 条</span>
-              <span>耗时 {formatElapsed(message.report.elapsed_s || 0)}</span>
-              <button
-                onClick={() => setShowReport(!showReport)}
-                className="text-brand-600 hover:text-brand-800 font-medium ml-auto"
-              >
-                {showReport ? "收起报告" : "查看报告"}
-              </button>
-            </div>
-
-            {showReport && message.report && (
-              <div className="animate-fade-in">
-                <ReportCard report={message.report} />
-                {message.report.constraints?.topology && (
-                  <SchematicPanel
-                    topology={message.report.constraints.topology}
-                    vin={message.report.constraints.input_voltage_nominal_v || 12}
-                    vout={message.report.constraints.output_voltage_v || 5}
-                    iout={message.report.constraints.output_current_a || 1}
-                  />
                 )}
               </div>
             )}
           </div>
         )}
       </div>
-
-      {isUser && (
-        <div className="w-8 h-8 rounded-full bg-gray-200 flex items-center justify-center shrink-0 mt-1">
-          <span className="text-xs text-gray-600 font-medium">U</span>
-        </div>
-      )}
     </div>
   );
 }

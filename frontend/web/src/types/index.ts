@@ -42,6 +42,18 @@ export interface ScoreBreakdown {
   reasons: string[];
   llm_application_score?: number;
   llm_design_risk_score?: number;
+  dim_scores?: {
+    param_match?: number;
+    reliability?: number;
+    quality?: number;
+    supply?: number;
+    manufacturing?: number;
+    compliance?: number;
+    commercial?: number;
+    fit?: number;
+    risk?: number;
+    [key: string]: number | undefined;
+  };
 }
 
 export interface ScoredPart {
@@ -78,8 +90,10 @@ export interface ChatMessage {
   timestamp: number;
   report?: AnalysisReport;
   isStreaming?: boolean;
-  thinking?: string;          // 思考过程文本（streaming 时逐步累积）
-  thinkingDone?: boolean;     // 思考过程是否已完成（主内容开始输出时置 true）
+  thinking?: string;
+  thinkingDone?: boolean;
+  missing_fields?: string[];      // P0 fields still needed (triggers ParameterForm)
+  accumulated_constraints?: Record<string, unknown>; // already-known params
 }
 
 export interface EvidenceItem {
@@ -112,6 +126,8 @@ export interface AnalysisReport {
   elapsed_s: number;
   summary: string;
   dimensions?: DimensionScore[];
+  lifecycle_alerts?: Array<{part_number: string; lifecycle_status: string; severity: string; alternatives: string[]}>;
+  reference_designs?: Array<{part_number: string; design_name: string; description: string; url: string}>;
 }
 
 export interface Session {

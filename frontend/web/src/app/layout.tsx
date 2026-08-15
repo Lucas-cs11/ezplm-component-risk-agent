@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { AuthGuard } from "@/components/AuthGuard";
 
 export const metadata: Metadata = {
   title: "eZmanbo — 智能元器件选型",
@@ -9,7 +10,9 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="zh-CN">
-      <body className="h-screen overflow-hidden">{children}</body>
+      <body className="h-screen overflow-hidden">
+        <AuthGuard>{children}</AuthGuard>
+      </body>
     </html>
   );
 }

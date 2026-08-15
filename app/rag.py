@@ -25,34 +25,20 @@ _embedding_model = None
 
 
 def _get_embedding_model():
-    """懒加载 sentence-transformers 模型（all-MiniLM-L6-v2，轻量）。
-
-    H2 修复：先尝试在线加载，失败后尝试离线模式，均失败时给出明确错误提示。
-    """
+    """懒加载 sentence-transformers 模型。检测本地缓存优先，避免联网超时。"""
     global _embedding_model
     if _embedding_model is None:
         import os as _os
+        from pathlib import Path as _Path
         from sentence_transformers import SentenceTransformer
-
-        # ── H2: 先尝试在线模式（首次部署可能无缓存）──
-        try:
-            _os.environ.pop("HF_HUB_OFFLINE", None)  # 清除可能的离线标记
-            _embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-        except Exception as online_err:
-            # 在线加载失败 → 尝试离线模式（本地已有缓存）
-            _os.environ["HF_HUB_OFFLINE"] = "1"
-            try:
-                _embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-            except Exception as offline_err:
-                _os.environ.pop("HF_HUB_OFFLINE", None)
-                raise RuntimeError(
-                    f"无法加载 embedding 模型 all-MiniLM-L6-v2。\n"
-                    f"在线加载错误: {online_err}\n"
-                    f"离线加载错误: {offline_err}\n"
-                    f"请执行以下命令下载模型: python -c \"from sentence_transformers import SentenceTransformer; "
-                    f"SentenceTransformer('all-MiniLM-L6-v2')\"\n"
-                    f"或手动下载到 ~/.cache/huggingface/hub/"
-                )
+        _hf_hub = _Path(_os.environ.get("HF_HOME", str(_Path.home() / ".cache" / "huggingface"))) / "hub"
+        _cached = (_hf_hub / "models--sentence-transformers--all-MiniLM-L6-v2").exists()
+        if _cached:
+            _embedding_model = SentenceTransformer("all-MiniLM-L6-v2", local_files_only=True)
+        else:
+            _os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+            _os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "15")
+            _embedding_model = SentenceTransformer("all-MiniLM-L6-v2", local_files_only=False)
     return _embedding_model
 
 
@@ -63,7 +49,7 @@ class RAGStore:
     内部自动分块（按段落）并生成 embedding。
     """
 
-    def __init__(self, persist_dir: str = "data/chroma_db"):
+    def __init__(self, persist_dir: str = str(Path(__file__).resolve().parent.parent / "data" / "chroma_db")):
         self._persist_dir = Path(persist_dir)
         self._persist_dir.mkdir(parents=True, exist_ok=True)
         self._client = chromadb.PersistentClient(
@@ -160,6 +146,27 @@ class RAGStore:
             metadata={"hnsw:space": "cosine"},
         )
 
+    def list_documents(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """列出知识库中已索引的文档条目。"""
+        try:
+            results = self._collection.get(
+                limit=limit,
+                include=["metadatas", "documents"],
+            )
+            docs = []
+            for i, doc_id in enumerate(results.get("ids", [])):
+                meta = (results["metadatas"][i] if results.get("metadatas") else {}) or {}
+                text = (results["documents"][i] if results.get("documents") else "") or ""
+                docs.append({
+                    "id": doc_id,
+                    "title": meta.get("title", "未命名"),
+                    "category": meta.get("category", ""),
+                    "preview": text[:120] + ("…" if len(text) > 120 else ""),
+                })
+            return docs
+        except Exception:
+            return []
+
 
 def build_context_from_results(results: List[Dict[str, Any]], max_chars: int = 1500) -> str:
     """将 RAG 检索结果拼接为 LLM 上下文文本。
@@ -200,3 +207,45 @@ def get_rag_store(persist_dir: str = "data/chroma_db") -> RAGStore:
     if _rag_store is None:
         _rag_store = RAGStore(persist_dir=persist_dir)
     return _rag_store
+
+
+def query_unified(query_text: str, n_results: int = 5, part_numbers: List[str] = None) -> List[Dict]:
+    """P2-8: 统一 RAG 查询入口 — 合并工程知识库 + 数据手册元数据两个知识源。
+
+    返回结构化结果列表，每项包含 source 字段区分来源：
+      source="engineering_knowledge" — ChromaDB 工程知识
+      source="datasheet_registry"    — 数据手册元数据
+    """
+    results: List[Dict] = []
+
+    # ── 1. 工程知识库（ChromaDB）────────────────────────────────
+    try:
+        store = get_rag_store()
+        rag_hits = store.query(query_text, n_results=n_results)
+        for hit in rag_hits:
+            results.append({**hit, "source": "engineering_knowledge"})
+    except Exception:
+        pass
+
+    # ── 2. 数据手册元数据（DatasheetRegistry 静态索引）──────────
+    if part_numbers:
+        try:
+            from .datasheet_rag import DatasheetRegistry
+            registry = DatasheetRegistry()
+            for pn in part_numbers:
+                meta = registry.get_metadata(pn)
+                if meta:
+                    results.append({
+                        "content": (
+                            f"{pn}: {getattr(meta, 'description', '')} "
+                            f"| 封装:{getattr(meta, 'package', '')} "
+                            f"| 制造商:{getattr(meta, 'manufacturer', '')}"
+                        ).strip(" |"),
+                        "metadata": {"part_number": pn},
+                        "score": 1.0,
+                        "source": "datasheet_registry",
+                    })
+        except Exception:
+            pass
+
+    return results

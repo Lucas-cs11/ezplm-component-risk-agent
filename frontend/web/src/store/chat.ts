@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { Session, ChatMessage } from "@/types";
+import type { ScoredPart } from "@/types";
 import { v4like } from "./id";
 
 export { v4like as generateId } from "./id";
@@ -8,6 +9,15 @@ const STORAGE_KEY = "ezmanbo_sessions";
 const MAX_SESSIONS = 50;
 
 export type HealthStatus = "connected" | "disconnected" | "checking";
+export type ThinkingDepth = "fast" | "standard" | "deep";
+
+export interface ToolCallEvent {
+  id: string;
+  type: string;
+  label: string;
+  ts: number;
+  data?: Record<string, unknown>;
+}
 
 interface ChatStore {
   sessions: Session[];
@@ -15,6 +25,20 @@ interface ChatStore {
   activeSession: () => Session | undefined;
   healthStatus: HealthStatus;
   setHealthStatus: (status: HealthStatus) => void;
+  selectedPartNumber: string | null;
+  setSelectedPart: (partNumber: string | null) => void;
+  pendingInput: string | null;
+  setPendingInput: (input: string | null) => void;
+  // Thinking depth
+  thinkingDepth: ThinkingDepth;
+  setThinkingDepth: (d: ThinkingDepth) => void;
+  // Tool call event log (cleared on new send)
+  toolCallEvents: ToolCallEvent[];
+  pushToolCallEvent: (evt: Omit<ToolCallEvent, "id" | "ts">) => void;
+  clearToolCallEvents: () => void;
+  // Selected part for result modal
+  selectedPartModal: ScoredPart | null;
+  setSelectedPartModal: (p: ScoredPart | null) => void;
 
   createSession: () => string;
   switchSession: (id: string) => void;
@@ -58,6 +82,11 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
   sessions: loadSessions(),
   activeSessionId: null,
   healthStatus: "checking" as HealthStatus,
+  selectedPartNumber: null,
+  pendingInput: null,
+  thinkingDepth: "standard" as ThinkingDepth,
+  toolCallEvents: [],
+  selectedPartModal: null,
 
   activeSession: () => {
     const { sessions, activeSessionId } = get();
@@ -65,6 +94,14 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
   },
 
   setHealthStatus: (status) => set({ healthStatus: status }),
+  setSelectedPart: (partNumber) => set({ selectedPartNumber: partNumber }),
+  setPendingInput: (input) => set({ pendingInput: input }),
+  setThinkingDepth: (d) => set({ thinkingDepth: d }),
+  pushToolCallEvent: (evt) => set((s) => ({
+    toolCallEvents: [...s.toolCallEvents, { ...evt, id: v4like(), ts: Date.now() }].slice(-100),
+  })),
+  clearToolCallEvents: () => set({ toolCallEvents: [] }),
+  setSelectedPartModal: (p) => set({ selectedPartModal: p }),
 
   createSession: () => {
     const session = createEmptySession();
@@ -144,9 +181,13 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
 
   // ── 后端会话同步 ──────────────────────────────────────
   syncSessionsFromBackend: async () => {
-    const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+    const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "";
     try {
-      const resp = await fetch(`${API_BASE}/agent/sessions`);
+      const { useAuthStore } = await import("@/store/authStore");
+      const token = useAuthStore.getState().token;
+      const resp = await fetch(`${API_BASE}/agent/sessions`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
       if (!resp.ok) return;
       const data = await resp.json();
       const backendSessions: Array<{ id: string; title: string; message_count: number }> = data.sessions || [];

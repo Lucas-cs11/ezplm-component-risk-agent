@@ -61,7 +61,8 @@ def _call_llm(system: str, user: str) -> str:
     """调用 LLM，失败时返回空字符串。"""
     try:
         from .llm_client import call_openai_chat_text
-        if not os.getenv("OPENAI_API_KEY", "").strip():
+        from .llm_config import get_api_key
+        if not get_api_key().strip():
             return ""
         return call_openai_chat_text(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],

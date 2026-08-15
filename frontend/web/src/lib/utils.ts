@@ -25,7 +25,7 @@ export const RISK_LABELS: Record<string, string> = {
   low:    "LOW",
 };
 
-export const LLM_MODEL = "eZmanbo / DeepSeek-V3";
+export const LLM_MODEL = "eZmanbo AI";
 
 // ── 选型上下文构建 ────────────────────────────────────────────
 

@@ -63,7 +63,7 @@ P1_QUESTIONS: Dict[str, str] = {
 # 输入电压: "输入12V", "Vin 5V", "输入最高20V", "输入电压最高 20V"
 # 使用负向后顾避免匹配"X V 输入"中的"输入"（那属于范围表达的后缀）
 _VIN_REGEX = re.compile(
-    r"(?:^|[^0-9])(?:输入|Vin|VIN|供电|电源)(?:电压|最高|最大|范围)?[\s\S]{0,4}?(\d+\.?\d*)\s*[Vv伏]"
+    r"(?:^|[^0-9])(?:输入|Vin|VIN|供电|电源)(?:电压|最高|最大|范围)?[^，,]{0,4}?(\d+\.?\d*)\s*[Vv伏]"
 )
 # 输出电压: "输出5V", "Vout 3.3V", "输出电压有5V", "转5V", "升到12V"
 _VOUT_REGEX = re.compile(
@@ -79,6 +79,11 @@ _VRANGE_REGEX = re.compile(
 )
 _CURRENT_INFER = re.compile(r"(\d+\.?\d*)\s*(?:A|a|安)(?![a-zA-Z])")
 _MA_INFER = re.compile(r"(\d+)\s*(?:mA|毫安|ｍＡ)")
+
+# 数值+关键词后置："12V 输入"（值在关键词前）
+_VIN_VALUE_FIRST = re.compile(r"(\d+\.?\d*)\s*[Vv伏]\s*(?:输入|Vin|VIN|供电|电源)")
+# 数值+关键词后置："3.3V 输出"（值在关键词前）
+_VOUT_VALUE_FIRST = re.compile(r"(\d+\.?\d*)\s*[Vv伏]\s*(?:输出|Vout|VOUT)")
 
 
 def extract_constraints(text: str) -> dict:
@@ -109,6 +114,16 @@ def extract_constraints(text: str) -> dict:
         if "input_voltage_nominal_v" not in result:
             result["input_voltage_nominal_v"] = float(xform_m.group(1))
         result["output_voltage_v"] = float(xform_m.group(2))
+
+    # ── 2.5. 数值+关键词后置：12V 输入，3.3V 输出 ────
+    # 处理 "12V 输入"、"5V 输出" 等值在关键词前，关键词在后的写法
+    vin_vf = _VIN_VALUE_FIRST.search(text)
+    if vin_vf and "input_voltage_nominal_v" not in result:
+        result["input_voltage_nominal_v"] = float(vin_vf.group(1))
+
+    vout_vf = _VOUT_VALUE_FIRST.search(text)
+    if vout_vf and "output_voltage_v" not in result:
+        result["output_voltage_v"] = float(vout_vf.group(1))
 
     # ── 3. 最高电压 ──────────────────────────────
     vmax_m = _VMAX_REGEX.search(text)
@@ -167,6 +182,12 @@ def extract_constraints(text: str) -> dict:
     elif re.search(r"\bldo\b|线性稳压|LDO", text, re.I):
         result["topology"] = "ldo"
 
+    # ── 11. 器件类别推断（由拓扑推导，供 pre_constraints 快速路径使用）──
+    if result.get("topology") in ("buck", "boost"):
+        result.setdefault("category", "dc_dc_converter")
+    elif result.get("topology") == "ldo":
+        result.setdefault("category", "ldo")
+
     return result
 
 
@@ -210,6 +231,14 @@ def check_completeness(constraints: dict) -> Tuple[bool, List[str], List[str]]:
     return (len(missing_p0) == 0, missing_p0, missing_p1)
 
 
+def template_fallback(confirmed_str: str, missing_all: list) -> str:
+    """LLM 不可用时的模板降级。"""
+    lines = [f"已确认：{confirmed_str}。"]
+    labels = [FIELD_LABELS.get(f, f) for f in missing_all] if missing_all else ["更多参数"]
+    lines.append(f"请继续提供：{'、'.join(labels[:3])}")
+    return "\n".join(lines)
+
+
 def generate_clarification_questions(missing_p0: List[str], missing_p1: List[str]) -> List[str]:
     """根据缺失字段生成自然语言追问列表。"""
     questions = []
@@ -239,46 +268,53 @@ def build_clarification_response(
     user_input: str,
     accumulated: dict,
     agent_name: str = "eZmanbo",
-) -> str:
-    """构建完整的追问回复。
+) -> tuple:
+    """基于 LLM 生成自然的追问回复。返回 (text, merged_constraints)。"""
+    from .llm_client import call_openai_chat_text
 
-    1. 确认已理解的信息
-    2. 指出缺失的关键参数
-    3. 给出明确的问题
-    """
     constraints = merge_constraints(accumulated, extract_constraints(user_input))
     is_complete, missing_p0, missing_p1 = check_completeness(constraints)
 
     if is_complete:
-        return ""  # 完整则不需要追问
+        return "", constraints
 
-    lines = []
-
-    # 已确认的信息
-    confirmed = []
+    # 构建已确认参数描述
+    confirmed_parts = []
     if constraints.get("input_voltage_nominal_v"):
-        confirmed.append(f"输入电压 {constraints['input_voltage_nominal_v']}V")
+        confirmed_parts.append(f"输入电压：{constraints['input_voltage_nominal_v']}V")
     if constraints.get("output_voltage_v"):
-        confirmed.append(f"输出电压 {constraints['output_voltage_v']}V")
+        confirmed_parts.append(f"输出电压：{constraints['output_voltage_v']}V")
     if constraints.get("output_current_a"):
-        confirmed.append(f"输出电流 {constraints['output_current_a']}A")
+        confirmed_parts.append(f"输出电流：{constraints['output_current_a']}A")
     if constraints.get("topology"):
-        topo_cn = {"buck": "降压(Buck)", "boost": "升压(Boost)", "ldo": "LDO"}.get(constraints["topology"], constraints["topology"])
-        confirmed.append(f"拓扑 {topo_cn}")
+        t = {"buck": "降压", "boost": "升压", "ldo": "线性稳压(LDO)", "buck_boost": "升降压"}.get(
+            constraints["topology"], constraints["topology"]
+        )
+        confirmed_parts.append(f"拓扑：{t}")
     if constraints.get("grade"):
-        grade_cn = {"automotive": "车规级", "industrial": "工业级", "commercial": "商业级"}.get(constraints["grade"], constraints["grade"])
-        confirmed.append(f"等级 {grade_cn}")
+        g = {"automotive":"车规级","industrial":"工业级","commercial":"商业级"}.get(constraints["grade"], constraints["grade"])
+        confirmed_parts.append(f"等级：{g}")
+    confirmed_str = "；".join(confirmed_parts) if confirmed_parts else "暂无"
 
-    if confirmed:
-        lines.append(f"已理解您的需求：{'，'.join(confirmed)}。")
-        lines.append("")
+    # 构建缺失参数描述
+    missing_all = (missing_p0 or []) + (missing_p1 or [])
+    missing_str = "、".join(FIELD_LABELS.get(f, f) for f in missing_all) if missing_all else "无"
 
-    # 追问
-    questions = generate_clarification_questions(missing_p0, missing_p1)
-    if questions:
-        lines.append("为了给出精准的选型推荐，还需要确认以下关键参数：")
-        lines.append("")
-        for i, q in enumerate(questions, 1):
-            lines.append(f"{i}. {q}")
-
-    return "\n".join(lines)
+    prompt = (
+        f"用户正在逐步提供选型需求。\n\n"
+        f"目前已确认的参数：{confirmed_str}\n"
+        f"还缺少的参数：{missing_str}\n\n"
+        f"用户最新输入：「{user_input[:200]}」\n\n"
+        f"请以自然、专业的中文回复用户，先简单确认已收到的信息，然后友好地询问最关键的缺失参数（一次只问最多2个问题）。"
+        f"不要使用列表编号，而是用自然的语句。不要提及\"P0\"\"P1\"等技术术语。"
+        f"回复控制在120字以内。"
+    )
+    system_msg = f"你是{agent_name}，专门负责电子元器件选型的智能助理。只讨论与电子器件选型相关的话题。绝对不要提及Claude、Anthropic或任何底层AI模型。"
+    try:
+        text = call_openai_chat_text(
+            [{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}],
+            thinking_depth="off",
+        ).strip() or template_fallback(confirmed_str, missing_all)
+    except Exception:
+        text = template_fallback(confirmed_str, missing_all)
+    return text, constraints

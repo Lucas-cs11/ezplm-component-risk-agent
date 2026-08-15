@@ -36,14 +36,39 @@ function ExportPanel({ sessionId }: { sessionId?: string }) {
   const handleExport = async (endpoint: string, filename: string, method = "GET") => {
     const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "";
     const url = `${API_BASE}${endpoint}?session_id=${sessionId}`;
-    const resp = await fetch(url, { method, headers: getAuthBearer() });
-    if (!resp.ok) return;
-    const blob = await resp.blob();
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = filename;
-    a.click();
-    URL.revokeObjectURL(a.href);
+    try {
+      const resp = await fetch(url, { method, headers: getAuthBearer() });
+      const contentType = resp.headers.get("content-type") || "";
+
+      // /report/* 端点返回 JSON { content, type }，而非可直接下载的文件流
+      if (contentType.includes("application/json")) {
+        const data = await resp.json();
+        if (!resp.ok) {
+          alert(data?.detail || "导出失败，请稍后重试");
+          return;
+        }
+        const blob = new Blob([data.content ?? ""], { type: "text/markdown;charset=utf-8" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(a.href);
+        return;
+      }
+
+      if (!resp.ok) {
+        alert("导出失败，请稍后重试");
+        return;
+      }
+      const blob = await resp.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch {
+      alert("导出请求失败，请检查网络连接");
+    }
   };
 
   const exports = [
@@ -147,55 +172,121 @@ function ParamsPanel() {
   const [verifierApiKey, setVerifierApiKey] = useState("");
   const [verifierBaseUrl, setVerifierBaseUrl] = useState("");
   const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [verifierConfigured, setVerifierConfigured] = useState(false);
+  const [dualModelToggling, setDualModelToggling] = useState(false);
 
   const { token } = useAuthStore();
+  const { user, setUser } = useAuthStore();
   const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "";
+  const isAdmin = user?.is_admin === true;
+  const isGuest = user?.is_guest === true;
+  const dualEnabled = user?.dual_model_enabled === true;
 
   React.useEffect(() => {
-    const loadConfig = async () => {
+    const loadData = async () => {
       try {
-        const resp = await fetch(`${API_BASE}/admin/config`, {
+        // All users: check verifier status
+        const sv = await fetch(`${API_BASE}/admin/verifier-status`, {
           headers: { Authorization: `Bearer ${token}` }
         });
-        if (resp.ok) {
-          const data = await resp.json();
-          setConfig(data);
-          setVerifierModel(data.verifier_model || "");
-          setVerifierApiKey(data.verifier_api_key_masked || "");
-          setVerifierBaseUrl(data.verifier_base_url || "");
+        if (sv.ok) {
+          const d = await sv.json();
+          setVerifierConfigured(d.configured);
+        }
+        // Admin only: load full config
+        if (isAdmin) {
+          const resp = await fetch(`${API_BASE}/admin/config`, {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+          if (resp.ok) {
+            const data = await resp.json();
+            setConfig(data);
+            setVerifierModel(data.verifier_model || "");
+            setVerifierApiKey(data.verifier_api_key_masked || "");
+            setVerifierBaseUrl(data.verifier_base_url || "");
+          }
         }
       } catch (e) {
         console.error("加载配置失败:", e);
       }
     };
-    if (token) loadConfig();
-  }, [token, API_BASE]);
+    if (token) loadData();
+  }, [token, API_BASE, isAdmin]);
+
+  const handleTestVerifier = async () => {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const resp = await fetch(`${API_BASE}/admin/config/test-verifier`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          verifier_model: verifierModel,
+          verifier_api_key: verifierApiKey || null,
+          verifier_base_url: verifierBaseUrl || null,
+        }),
+      });
+      const data = await resp.json();
+      if (resp.ok) {
+        setTestResult({ ok: true, msg: `连接成功：${data.response || "OK"}` });
+      } else {
+        setTestResult({ ok: false, msg: data.detail || "连接失败" });
+      }
+    } catch (e: any) {
+      setTestResult({ ok: false, msg: `请求错误: ${e.message}` });
+    } finally {
+      setTesting(false);
+    }
+  };
 
   const handleSaveVerifier = async () => {
     setSaving(true);
     try {
       const resp = await fetch(`${API_BASE}/admin/config`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`
-        },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({
           verifier_model: verifierModel || null,
           verifier_api_key: verifierApiKey || null,
-          verifier_base_url: verifierBaseUrl || null
-        })
+          verifier_base_url: verifierBaseUrl || null,
+        }),
       });
       if (resp.ok) {
-        alert("双模型验证配置已保存");
+        setVerifierConfigured(!!verifierModel.trim());
+        setTestResult(null);
       } else {
         alert("保存失败");
       }
     } catch (e) {
-      console.error("保存配置失败:", e);
       alert("保存配置失败");
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleToggleDualModel = async () => {
+    if (isGuest) return;
+    setDualModelToggling(true);
+    try {
+      const newVal = !dualEnabled;
+      const resp = await fetch(`${API_BASE}/auth/me/dual-model`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ enabled: newVal }),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        if (user) setUser({ ...user, dual_model_enabled: data.dual_model_enabled });
+      } else {
+        const err = await resp.json();
+        alert(err.detail || "操作失败");
+      }
+    } catch (e) {
+      alert("请求失败");
+    } finally {
+      setDualModelToggling(false);
     }
   };
 
@@ -226,28 +317,71 @@ function ParamsPanel() {
         </div>
       </div>
 
-      <div className="pt-4 border-t border-slate-100 space-y-3">
-        <p className="text-xs font-bold text-slate-600">双模型验证配置</p>
-        <div>
-          <label className="block text-[10px] font-bold text-slate-500 mb-1.5 uppercase tracking-wide">验证模型</label>
-          <input type="text" value={verifierModel} onChange={(e) => setVerifierModel(e.target.value)} placeholder="例：claude-opus-5"
-            className="w-full h-9 bg-slate-50 border border-slate-200 rounded-xl px-3 text-xs text-slate-800 focus:outline-none focus:border-teal-400 transition-colors" />
+      {/* ── 双模型验证开关（所有已登录用户可见）────── */}
+      {!isGuest && (
+        <div className="pt-4 border-t border-slate-100">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wide">双模型验证</p>
+              <p className="text-[9px] text-slate-400 mt-0.5">
+                {verifierConfigured ? "开启后选型结果经双模型独立对比" : "管理员尚未配置验证模型"}
+              </p>
+            </div>
+            <button
+              onClick={handleToggleDualModel}
+              disabled={!verifierConfigured || dualModelToggling}
+              className={cn(
+                "w-10 h-5 rounded-full flex items-center px-0.5 transition-colors",
+                dualEnabled && verifierConfigured ? "bg-teal-500" : "bg-slate-200",
+                (!verifierConfigured || dualModelToggling) && "opacity-50 cursor-not-allowed"
+              )}
+            >
+              <div className={cn("w-4 h-4 bg-white rounded-full shadow transition-transform", dualEnabled && verifierConfigured ? "ml-auto" : "")} />
+            </button>
+          </div>
+          {dualEnabled && verifierConfigured && (
+            <p className="text-[9px] text-teal-600 font-bold mt-1.5">已开启 · 下次选型将自动触发双模型验证</p>
+          )}
         </div>
-        <div>
-          <label className="block text-[10px] font-bold text-slate-500 mb-1.5 uppercase tracking-wide">API Key（可选）</label>
-          <input type="password" value={verifierApiKey} onChange={(e) => setVerifierApiKey(e.target.value)} placeholder="留空则使用主模型密钥"
-            className="w-full h-9 bg-slate-50 border border-slate-200 rounded-xl px-3 text-xs text-slate-800 focus:outline-none focus:border-teal-400 transition-colors" />
+      )}
+
+      {/* ── 验证模型配置（仅管理员可见）────── */}
+      {isAdmin && (
+        <div className="pt-4 border-t border-slate-100 space-y-3">
+          <p className="text-xs font-bold text-slate-600">验证模型配置 <span className="text-[9px] text-amber-500 font-normal ml-1">管理员</span></p>
+          <div>
+            <label className="block text-[10px] font-bold text-slate-500 mb-1.5 uppercase tracking-wide">验证模型</label>
+            <input type="text" value={verifierModel} onChange={(e) => { setVerifierModel(e.target.value); setTestResult(null); }} placeholder="例：claude-opus-5"
+              className="w-full h-9 bg-slate-50 border border-slate-200 rounded-xl px-3 text-xs text-slate-800 focus:outline-none focus:border-teal-400 transition-colors" />
+          </div>
+          <div>
+            <label className="block text-[10px] font-bold text-slate-500 mb-1.5 uppercase tracking-wide">API Key（可选）</label>
+            <input type="password" value={verifierApiKey} onChange={(e) => { setVerifierApiKey(e.target.value); setTestResult(null); }} placeholder="留空则使用主模型密钥"
+              className="w-full h-9 bg-slate-50 border border-slate-200 rounded-xl px-3 text-xs text-slate-800 focus:outline-none focus:border-teal-400 transition-colors" />
+          </div>
+          <div>
+            <label className="block text-[10px] font-bold text-slate-500 mb-1.5 uppercase tracking-wide">Base URL（可选）</label>
+            <input type="text" value={verifierBaseUrl} onChange={(e) => { setVerifierBaseUrl(e.target.value); setTestResult(null); }} placeholder="留空则使用主模型URL"
+              className="w-full h-9 bg-slate-50 border border-slate-200 rounded-xl px-3 text-xs text-slate-800 focus:outline-none focus:border-teal-400 transition-colors" />
+          </div>
+          {testResult && (
+            <p className={cn("text-[10px] px-2 py-1 rounded-lg", testResult.ok ? "text-teal-700 bg-teal-50" : "text-red-700 bg-red-50")}>
+              {testResult.msg}
+            </p>
+          )}
+          <div className="flex gap-2">
+            <button onClick={handleTestVerifier} disabled={testing || !verifierModel.trim()}
+              className="flex-1 h-8 bg-slate-100 text-slate-700 rounded-xl text-xs font-bold hover:bg-slate-200 disabled:bg-slate-50 disabled:text-slate-300 transition-colors">
+              {testing ? "测试中…" : "测试连接"}
+            </button>
+            <button onClick={handleSaveVerifier} disabled={saving || !testResult?.ok}
+              className="flex-1 h-8 bg-teal-500 text-white rounded-xl text-xs font-bold hover:bg-teal-600 disabled:bg-slate-300 transition-colors">
+              {saving ? "保存中…" : "保存配置"}
+            </button>
+          </div>
+          <p className="text-[9px] text-slate-400">需先通过测试连接，才能保存配置</p>
         </div>
-        <div>
-          <label className="block text-[10px] font-bold text-slate-500 mb-1.5 uppercase tracking-wide">Base URL（可选）</label>
-          <input type="text" value={verifierBaseUrl} onChange={(e) => setVerifierBaseUrl(e.target.value)} placeholder="留空则使用主模型URL"
-            className="w-full h-9 bg-slate-50 border border-slate-200 rounded-xl px-3 text-xs text-slate-800 focus:outline-none focus:border-teal-400 transition-colors" />
-        </div>
-        <button onClick={handleSaveVerifier} disabled={saving}
-          className="w-full h-8 bg-teal-500 text-white rounded-xl text-xs font-bold hover:bg-teal-600 disabled:bg-slate-300 transition-colors">
-          {saving ? "保存中..." : "保存配置"}
-        </button>
-      </div>
+      )}
     </div>
   );
 }

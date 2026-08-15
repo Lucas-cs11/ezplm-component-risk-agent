@@ -838,7 +838,7 @@ def generate_bom_excel(report: SelectionReport) -> bytes:
             item_no, 2, "PCBA Assembly", "TBD", 1, "pcs",
             mount, "Top", category, description,
             value, "N/A", rating,
-            p.package or "TBD", "TBD",
+            p.package or "TBD", p.footprint_file or p.package or "TBD",
             p.manufacturer or "TBD", p.part_number,
             lc, "eZ-PLM", "TBD",
             alt_mpns, rohs, reach, "TBD",

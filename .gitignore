@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 .DS_Store
 __pycache__/
 *.pyc
@@ -15,8 +17,14 @@ data/mock_parts.json.backup*
 # Runtime artifacts (scripts output)
 docs/datasheets/*.json
 
-# OMC agent runtime memory
-memory/
+# Build artifacts
+dist/
+build/
+*.spec
+node_modules/
+.sessions/
+.pids/
+*.log
 
 # Large binary assets (keep only in frontend/public)
 icon.png

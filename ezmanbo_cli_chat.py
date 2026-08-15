@@ -13,6 +13,59 @@ eZmanbo CLI — Claude Code 风格终端对话 REPL
 import sys
 import os
 import json
+import argparse
+
+# ── 命令行参数解析（模型管理 + 思考深度）─────────────────────
+_API_BASE = os.environ.get("EZMANBO_API_BASE", "http://localhost:8000")
+
+def _list_models():
+    """从后端 API 获取可用模型列表。"""
+    import urllib.request
+    try:
+        resp = urllib.request.urlopen(f"{_API_BASE}/api/models", timeout=5)
+        data = json.loads(resp.read())
+        print("可用模型：")
+        for m in data.get("models", []):
+            marker = "  → " if m["id"] == data.get("active") else "    "
+            print(f"{marker}{m['id']}  —  {m['name']}")
+            print(f"      {m['description']}")
+        print(f"\n当前激活：{data.get('active', '未知')}")
+    except Exception as e:
+        print(f"获取模型列表失败: {e}")
+    sys.exit(0)
+
+def _switch_model(model_id: str):
+    """通过后端 API 切换模型。"""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"{_API_BASE}/api/models/switch",
+            data=json.dumps({"model": model_id}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        print(f"已切换至: {data.get('active', model_id)}")
+    except Exception as e:
+        print(f"切换模型失败: {e}")
+    sys.exit(0)
+
+parser = argparse.ArgumentParser(description="eZmanbo CLI — 电子元器件智能选型与对话")
+parser.add_argument("--list-models", action="store_true", help="列出可用模型")
+parser.add_argument("--switch-model", type=str, help="切换到指定模型（如 deepseek-v4-pro）")
+parser.add_argument("--thinking", type=str, default="default",
+                    choices=["off", "default", "contemplation", "exhaustive"],
+                    help="思考深度（off=关闭, default=标准, contemplation=深入, exhaustive=穷究）")
+args, remaining = parser.parse_known_args()
+
+if args.list_models:
+    _list_models()
+if args.switch_model:
+    _switch_model(args.switch_model)
+
+# 将思考深度写入环境变量供下游模块读取
+os.environ["EZMANBO_THINKING_DEPTH"] = args.thinking
 import urllib.request
 import urllib.error
 import socket
@@ -24,6 +77,7 @@ API_BASE = "http://127.0.0.1:8000"
 SESSION_ID: Optional[str] = None
 REQUEST_TIMEOUT = 180
 THINKING_DEPTH = "default"   # off | default | contemplation | exhaustive
+_has_active_selection = False  # 跟踪当前会话是否已完成过选型（用于 adjustment 检测）
 
 from rich.console import Console
 from rich.markdown import Markdown
@@ -128,15 +182,17 @@ def _cmd_help():
 
 
 def _cmd_clear():
-    global SESSION_ID
+    global SESSION_ID, _has_active_selection
     SESSION_ID = None
+    _has_active_selection = False
     _update_status(used_tokens=0, total_cost_usd=0.0, context_used_pct=0.0)
     return f"{DIAMOND_FILLED} Session cleared."
 
 
 def _cmd_new():
-    global SESSION_ID
+    global SESSION_ID, _has_active_selection
     SESSION_ID = None
+    _has_active_selection = False
     _update_status(used_tokens=0, total_cost_usd=0.0, context_used_pct=0.0)
     return f"{DIAMOND_FILLED} New session."
 
@@ -359,7 +415,7 @@ def _api(path: str, data: dict, timeout: int = 60) -> dict:
 
 
 def _classify(text: str) -> dict:
-    return _api("/classify", {"user_input": text})
+    return _api("/classify", {"user_input": text, "has_active_selection": _has_active_selection})
 
 
 def _is_port_open() -> bool:
@@ -853,6 +909,8 @@ def repl():
             # 选型完成后向 Agent 注入上下文，避免下一轮对话丢失
             if summary:
                 _inject_selection_context(summary)
+                global _has_active_selection
+                _has_active_selection = True
         else:
             _chat(user_input)
 
@@ -878,6 +936,8 @@ def single_query(text: str):
 
 if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    import dotenv; dotenv.load_dotenv(override=True)
+    _td = os.environ.get("EZMANBO_THINKING_DEPTH", "default")
     if len(sys.argv) > 1:
         single_query(" ".join(sys.argv[1:]))
     else:

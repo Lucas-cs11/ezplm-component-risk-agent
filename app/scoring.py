@@ -492,24 +492,9 @@ def _fit_d4_supply(part: PartIR) -> Tuple[float, List[str]]:
         reasons.append("生命周期状态未知，供应不确定性高")
     scores.append(lc_score)
 
-    # 库存评分（效益型）
-    if part.stock is not None:
-        stock_score = _benefit(float(part.stock), 0, 5000)
-        if part.stock > 5000:
-            reasons.append(f"✓ 库存充裕（{part.stock} 件）")
-        elif part.stock > 1000:
-            reasons.append(f"✓ 库存充足（{part.stock} 件）")
-        elif part.stock > 200:
-            reasons.append(f"库存尚可（{part.stock} 件）")
-        elif part.stock > 0:
-            reasons.append(f"⚠ 库存偏低（{part.stock} 件）")
-        else:
-            reasons.append("✗ 库存为零，断供风险极高")
-            stock_score = 0.0
-        scores.append(stock_score)
-    else:
-        scores.append(40.0)
-        reasons.append("库存信息缺失，供应不确定")
+    # 库存数据不可用（eZ-PLM v1 不返回实时库存），按中等默认值处理
+    scores.append(40.0)
+    reasons.append("库存信息不可用，供应不确定性参考中值")
 
     return sum(scores) / len(scores), reasons
 
@@ -572,7 +557,7 @@ def _fit_d6_compliance(
     constraints: RequirementConstraints,
 ) -> Tuple[float, List[str]]:
     """D6 合规与可持续性（0–100）。"""
-    source = (part.source or "").lower()
+    source = (getattr(part, "source", "unknown") or "").lower()
 
     if part.automotive_grade:
         return 85.0, ["✓ AEC-Q 认证，主要合规证据充分"]
@@ -675,7 +660,7 @@ def _compute_risk_score(
     """
     profile = _get_profile(constraints)
     lc = (part.lifecycle_status or "").lower().strip()
-    source = (part.source or "").lower()
+    source = (getattr(part, "source", "unknown") or "").lower()
     is_ezplm = source in ("ezplm", "api", "ezplm_api")
     grade = (getattr(constraints, "grade", None) or "").lower()
     automotive_req = grade in ("automotive", "车规")
@@ -817,14 +802,14 @@ def _compute_confidence(part: PartIR) -> float:
     if has_local_ds:
         S = 1.00   # 原厂数据手册 → 最高可靠度
     else:
-        source = (part.source or "").lower()
+        source = (getattr(part, "source", "unknown") or "").lower()
         if source in ("ezplm", "api", "ezplm_api"):
             S = 0.80   # 授权分销商直接数据
         else:
             S = 0.50   # 普通聚合网站或未确认数据
 
     # 时效因子 T（库存/价格 30天内认为新鲜；静态参数衰减慢）
-    T_dynamic = 0.95 if (has_local_ds or (part.source or "").lower() in ("ezplm", "api", "ezplm_api")) else 0.70
+    T_dynamic = 0.95 if (has_local_ds or (getattr(part, "source", "unknown") or "").lower() in ("ezplm", "api", "ezplm_api")) else 0.70
     T_static = 1.00  # 数据手册静态参数
 
     # 完整性因子 M（字段覆盖率）
@@ -948,17 +933,17 @@ def _assign_recommendation_level(
     """
     if gate.status == "FAIL":
         return "not_recommended", "E"
-    # Grade A: 极高综合质量，可信度充分
-    if RS >= 85 and R <= 20 and C >= 80 and rank <= _MAX_RECOMMENDED:
+    # Grade A: 较高综合质量（标准相对放宽以适应实际数据覆盖）
+    if RS >= 70 and R <= 25 and C >= 65 and rank <= _MAX_RECOMMENDED:
         return "recommended", "A"
-    # Grade B: 推荐，可信度≥65（允许少量非关键字段缺失）
-    if RS >= 75 and R <= 35 and C >= 65 and rank <= _MAX_RECOMMENDED:
+    # Grade B: 推荐，可信度≥50
+    if RS >= 55 and R <= 40 and C >= 50 and rank <= _MAX_RECOMMENDED:
         return "recommended", "B"
     # Grade C: 条件推荐（含 Gate Conditional）
-    if RS >= 65 or gate.status == "CONDITIONAL":
+    if RS >= 40 or gate.status == "CONDITIONAL":
         return "backup", "C"
-    # Grade D: 不优先（风险偏高或评分低）
-    if RS >= 50:
+    # Grade D: 不优先
+    if RS >= 25:
         return "backup", "D"
     return "not_recommended", "D"
 
@@ -1021,7 +1006,8 @@ def score_candidates(
         candidates:       候选器件列表（PartIR）
         ref_designs_map:  {part_number: [reference_design, ...]}，可选
     """
-    has_llm_key = bool(os.getenv("OPENAI_API_KEY", "").strip())
+    from .llm_config import get_api_key
+    has_llm_key = bool(get_api_key().strip())
     use_llm = has_llm_key and ref_designs_map is not None
     _score_with_llm = None
     if use_llm:
@@ -1130,21 +1116,32 @@ def score_candidates(
 
         # ── Step 8: 构建 ScoreBreakdown ─────────────────────────────
         sb = ScoreBreakdown(
-            parameter_match_score=round(dim_scores["D1"], 2),   # D1 功能参数适配
-            supply_risk_score=round(dim_scores["D4"], 2),        # D4 供应链适配
-            cost_score=round(dim_scores["D7"], 2),               # D7 商业成本
-            domestic_score=round(dom_score, 2),                  # 国产化加分
-            evidence_score=round(C, 2),                          # 可信度
-            total_score=round(RS, 2),                            # 最终推荐分
+            parameter_match_score=round(dim_scores["D1"], 2),
+            supply_risk_score=round(dim_scores["D4"], 2),
+            cost_score=round(dim_scores["D7"], 2),
+            domestic_score=round(dom_score, 2),
+            evidence_score=round(C, 2),
+            total_score=round(RS, 2),
             reasons=reasons,
             scoring_mode=scoring_mode,
-            llm_application_score=round(F, 2),                   # 综合适配度 F
-            llm_design_risk_score=round(100.0 - R, 2),           # 风险倒置分（高=低风险）
+            llm_application_score=round(F, 2),
+            llm_design_risk_score=round(100.0 - R, 2),
             llm_reasoning=(
                 f"F={F:.1f} R={R:.1f} C={C:.1f} B={B:.1f} "
                 f"Gate={gate.status} RS={RS:.1f}"
                 + (f" | {llm_reasoning}" if llm_reasoning else "")
             ),
+            dim_scores={
+                "param_match": round(dim_scores["D1"], 1),
+                "reliability": round(dim_scores["D2"], 1),
+                "quality":     round(dim_scores["D3"], 1),
+                "supply":      round(dim_scores["D4"], 1),
+                "manufacturing": round(dim_scores["D5"], 1),
+                "compliance":  round(dim_scores["D6"], 1),
+                "commercial":  round(dim_scores["D7"], 1),
+                "fit":         round(F, 1),
+                "risk":        round(R, 1),
+            },
         )
         sp = ScoredPart(part=p, score=sb)
         raw_scored.append(sp)

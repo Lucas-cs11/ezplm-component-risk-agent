@@ -1,9 +1,19 @@
 import os
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)  # override=True 确保加载 .env 文件覆盖 shell 环境变量
+
+# 如果存在 Anthropic/Claude 风格的环境变量，优先映射到 OPENAI_* 以保持向后兼容
+_anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+if _anthropic_key:
+    # 仅在未显式设置 OPENAI_* 时进行映射（保留显式 OPENAI_* 优先级）
+    os.environ.setdefault("OPENAI_API_KEY", _anthropic_key)
+    if os.getenv("ANTHROPIC_BASE_URL", ""):
+        os.environ.setdefault("OPENAI_BASE_URL", os.getenv("ANTHROPIC_BASE_URL"))
+    if os.getenv("ANTHROPIC_MODEL", ""):
+        os.environ.setdefault("OPENAI_MODEL", os.getenv("ANTHROPIC_MODEL"))
 
 from typing import Optional, Dict, Any, AsyncGenerator
-from fastapi import FastAPI, Request, Body, UploadFile, File, Form
+from fastapi import FastAPI, Request, Body, UploadFile, File, Form, Depends
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,17 +23,97 @@ import time
 import asyncio
 import traceback
 from .agent_orchestrator import analyze, replacement_report
+from .setup_api import router as setup_router
+from sqlalchemy.orm import Session as DBSession
+from .database import get_db, init_db
+from .auth import get_current_user, get_optional_user
+from .models_db import ChatSession as ChatSessionDB, ChatMessage as ChatMessageDB
+from .routers.auth_router import router as auth_router
+from .routers.admin_router import router as admin_router, _apply_config_to_env
+from .session_store import constraint_store
 
 # ── 会话级报告缓存（供 /report/{type} 端点使用）────────────────
 # key=session_id, value=(SelectionReport, constraints)
 _session_reports: Dict[str, Any] = {}
 _session_constraints: Dict[str, Any] = {}
+_session_selected_part: Dict[str, Optional[str]] = {}  # session_id → selected part_number
 _DEFAULT_SESSION_ID = "__default__"  # 未提供 session_id 时的兜底key
+_SERVER_START_TIME = time.time()  # 服务启动时间（用于 /health 上报运行时长）
+
+_SESSION_STORE_MAX = 500  # P0-4: cap in-memory session store to prevent unbounded growth
+
+def _evict_session_stores() -> None:
+    """Evict oldest entries when any session dict exceeds the cap."""
+    for d in (_session_reports, _session_constraints, _session_selected_part):
+        if len(d) > _SESSION_STORE_MAX:
+            evict_n = len(d) - _SESSION_STORE_MAX + 50  # evict 50 extra to amortise cost
+            for _ in range(evict_n):
+                try:
+                    d.pop(next(iter(d)))
+                except StopIteration:
+                    break
+
+# ── 运行时模型管理（支持 API 动态切换，覆盖环境变量）───────────
+_runtime_model: Optional[str] = None  # None 表示使用环境变量默认值
+
+AVAILABLE_MODELS = [
+    {"id": "deepseek-v4-pro",   "name": "DeepSeek V4 Pro",    "description": "强推理模式，适用于复杂选型分析"},
+    {"id": "deepseek-v4-flash", "name": "DeepSeek V4 Flash",  "description": "快速响应模式，适用于标准选型"},
+]
+
+def get_active_model() -> str:
+    """优先级：运行时 > 环境变量 > DB > 硬编码默认。"""
+    if _runtime_model:
+        return _runtime_model
+    from .llm_config import get_model
+    m = get_model()
+    if m:
+        return m
+    try:
+        from .database import SessionLocal
+        from .models_db import AdminConfig
+        _db = SessionLocal()
+        cfg = _db.query(AdminConfig).first()
+        _db.close()
+        if cfg and cfg.llm_model:
+            return cfg.llm_model
+    except Exception:
+        pass
+    return "claude-sonnet-5"
 
 app = FastAPI()
+app.include_router(setup_router)
+app.include_router(auth_router)
+app.include_router(admin_router)
+
+@app.on_event("startup")
+async def _on_startup():
+    init_db()
+    # DB 迁移：为旧数据库添加 accumulated_constraints 列（新建时 models_db 已含）
+    try:
+        from sqlalchemy import text
+        from .database import engine
+        with engine.connect() as _conn:
+            _conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN accumulated_constraints TEXT"))
+            _conn.commit()
+    except Exception:
+        pass  # 列已存在则忽略
+    try:
+        from .database import SessionLocal
+        from .models_db import AdminConfig
+        _db = SessionLocal()
+        cfg = _db.query(AdminConfig).first()
+        if cfg:
+            _apply_config_to_env(cfg)
+        _db.close()
+    except Exception:
+        pass
 
 # ── CORS 配置，从环境变量读取白名单（M2）──────────────────────
-_cors_origins_raw = os.environ.get("CORS_ORIGINS", "http://localhost:3000,http://localhost:3001").split(",")
+_cors_origins_raw = os.environ.get(
+    "CORS_ORIGINS",
+    "http://localhost:3000,http://localhost:3001,https://ezmanbo.online,https://www.ezmanbo.online"
+).split(",")
 _cors_origins = [o.strip() for o in _cors_origins_raw if o.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -33,10 +123,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# P2-5: request_id middleware — injects unique ID into every request for end-to-end tracing
+import uuid as _uuid
+from .log_util import set_request_id as _set_rid
+
+@app.middleware("http")
+async def _request_id_middleware(request: Request, call_next):
+    rid = request.headers.get("X-Request-ID") or _uuid.uuid4().hex[:8]
+    _set_rid(rid)
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = rid
+    return response
+
 class AnalyzeRequest(BaseModel):
     user_input: str
-    thinking_depth: str = "default"  # off | default | contemplation | exhaustive
-    session_id: Optional[str] = None  # C1: 会话隔离
+    thinking_depth: str = "default"
+    session_id: Optional[str] = None
+    pre_constraints: Optional[dict] = None  # 跳过LLM解析，直接使用已提取的结构化约束
+    skip_cache: bool = False  # adjustment 意图：跟进语句通用性强，跨会话易误命中缓存
 
 class ReplacementRequest(BaseModel):
     original_part_number: str
@@ -51,10 +155,52 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "started_at": _SERVER_START_TIME,
+        "uptime_s": round(time.time() - _SERVER_START_TIME),
+    }
+
+@app.get("/api/models")
+async def list_models(current_user=Depends(get_current_user), db: DBSession = Depends(get_db)):
+    """返回当前管理员配置的可用模型及激活模型。"""
+    from .models_db import AdminConfig
+    from .routers.admin_router import PROVIDERS
+    cfg = db.query(AdminConfig).first()
+    active = (cfg.llm_model if cfg and cfg.llm_model else None) or get_active_model()
+    provider_id = cfg.llm_provider if cfg else "custom"
+    provider_info = PROVIDERS.get(provider_id, {})
+    provider_models = provider_info.get("models", [])
+    models = [{"id": m_id, "name": m_id, "description": provider_info.get("name", "")} for m_id in provider_models]
+    if not any(m["id"] == active for m in models):
+        models.insert(0, {"id": active, "name": active, "description": ""})
+    return {"models": models, "active": active, "provider": provider_id}
+
+@app.post("/api/models/switch")
+async def switch_model(body: dict = Body(...), current_user=Depends(get_current_user), db: DBSession = Depends(get_db)):
+    """切换运行时模型并持久化到 DB。"""
+    model_id = body.get("model")
+    if not model_id:
+        return JSONResponse(status_code=400, content={"detail": "缺少 model 字段"})
+    global _runtime_model
+    _runtime_model = model_id
+    os.environ["ANTHROPIC_MODEL"] = model_id
+    os.environ["OPENAI_MODEL"] = model_id
+    try:
+        from .models_db import AdminConfig
+        cfg = db.query(AdminConfig).first()
+        if cfg:
+            cfg.llm_model = model_id
+            db.commit()
+    except Exception:
+        pass
+    return {"status": "ok", "active": model_id}
 
 @app.post("/analyze")
-async def analyze_endpoint(body: AnalyzeRequest):
+async def analyze_endpoint(
+    body: AnalyzeRequest,
+    current_user=Depends(get_current_user),
+):
     """Pipeline 模式：单次调用，返回完整 SelectionReport JSON。
 
     ── B4：语义缓存支持 ──
@@ -63,22 +209,20 @@ async def analyze_endpoint(body: AnalyzeRequest):
     """
     try:
         session_id = body.session_id or _DEFAULT_SESSION_ID
-        # ── B4：检查语义缓存 ──────────────────────────────────────
-        from .semantic_cache import get_semantic_cache
-        cache = get_semantic_cache()
-        cache_result = cache.get(body.user_input)
-        cache_header = "HIT" if cache_result is not None else "MISS"
+        # The non-streaming path always executes the pipeline. Raw-text
+        # semantic matches are not valid selection-report cache hits.
+        cache_header = "MISS"
 
         # P1: 优先使用 LangGraph 状态机（含 CriticNode + 自动放宽）
         try:
             from .langgraph_orchestrator import run_selection_pipeline
-            result = run_selection_pipeline(body.user_input)
+            result = run_selection_pipeline(body.user_input, thinking_depth=body.thinking_depth)
             if result.get("report"):
                 report = result["report"]
             else:
-                report = analyze(body.user_input)  # fallback
+                report = analyze(body.user_input, thinking_depth=body.thinking_depth)  # fallback
         except Exception:
-            report = analyze(body.user_input)
+            report = analyze(body.user_input, thinking_depth=body.thinking_depth)
 
         _session_reports[session_id] = report
         _session_constraints[session_id] = report.constraints
@@ -93,7 +237,7 @@ async def analyze_endpoint(body: AnalyzeRequest):
         )
 
 @app.post("/replacement")
-async def replacement_endpoint(body: ReplacementRequest):
+async def replacement_endpoint(body: ReplacementRequest, current_user=Depends(get_current_user)):
     """替代器件查找。"""
     try:
         return replacement_report(body.original_part_number)
@@ -110,14 +254,41 @@ class AgentRequest(BaseModel):
     user_input: str
     session_id: Optional[str] = None
     thinking_depth: str = "default"
+    accumulated_input: Optional[str] = None   # 多轮澄清时累积的上下文
+    has_active_selection: bool = False         # 当前会话是否已有选型结果
 
 @app.post("/agent/chat")
-async def agent_chat_endpoint(body: AgentRequest):
+async def agent_chat_endpoint(
+    body: AgentRequest,
+    current_user=Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
     """ReAct Agent 模式：支持多轮对话，返回推理过程 + 工具调用记录。"""
     try:
         from .react_agent import run_agent
         result = run_agent(body.user_input, session_id=body.session_id,
                           thinking_depth=body.thinking_depth)
+
+        # ── DB 会话持久化（游客跳过）────────────────────────
+        try:
+            if not getattr(current_user, 'is_guest', False):
+                sid = body.session_id or _DEFAULT_SESSION_ID
+                session_db = db.query(ChatSessionDB).filter(
+                    ChatSessionDB.id == sid, ChatSessionDB.user_id == current_user.id
+                ).first()
+                if not session_db:
+                    session_db = ChatSessionDB(id=sid, user_id=current_user.id, title="新的选型")
+                    db.add(session_db)
+                db.add(ChatMessageDB(session_id=sid, role="user", content=body.user_input[:10000]))
+                resp_text = result.get("response", "") if isinstance(result, dict) else ""
+                if resp_text:
+                    db.add(ChatMessageDB(session_id=sid, role="assistant", content=resp_text[:10000]))
+                db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
         # ── Memory：提取并记录用户称呼 ──────────────────────
         try:
@@ -134,38 +305,46 @@ async def agent_chat_endpoint(body: AgentRequest):
 
         return result
     except Exception as e:
+        # 如果下游 LLM/服务返回明确的 HTTP 错误（如余额不足 402），把它映射回客户端
+        msg = str(e)
+        status_code = 500
+        try:
+            if "Insufficient Balance" in msg or "402" in msg or "invalid_request_error" in msg:
+                status_code = 402
+        except Exception:
+            status_code = 500
         return JSONResponse(
-            status_code=500,
-            content={"detail": f"Agent 错误: {str(e)}"},
+            status_code=status_code,
+            content={"detail": f"Agent 错误: {msg}"},
         )
 
 @app.get("/agent/sessions")
-async def agent_sessions_endpoint():
-    """列出当前活跃的 Agent 会话，含元数据（标题、消息数）。"""
-    from langchain_core.messages import HumanMessage
-    from .react_agent import _sessions
-    sessions = []
-    for sid, msgs in _sessions.items():
-        # 从第一条用户消息提取标题
-        title = "新的对话"
-        for m in msgs:
-            if isinstance(m, HumanMessage) and m.content:
-                raw = str(m.content).strip()
-                # 跳过内部注入的系统消息
-                if raw.startswith("[选型上下文") or raw.startswith("[selection_context"):
-                    continue
-                title = raw[:30].replace("\n", " ")
-                break
-        sessions.append({
-            "id": sid,
-            "title": title,
-            "message_count": len(msgs),
-        })
-    return {"sessions": sessions, "total": len(sessions)}
+async def agent_sessions_endpoint(
+    current_user=Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
+    """列出当前用户的会话（从数据库加载，按用户隔离）。"""
+    sessions_db = (
+        db.query(ChatSessionDB)
+        .filter(ChatSessionDB.user_id == current_user.id)
+        .order_by(ChatSessionDB.updated_at.desc())
+        .all()
+    )
+    return {
+        "sessions": [
+            {"id": s.id, "title": s.title, "message_count": len(s.messages)}
+            for s in sessions_db
+        ],
+        "total": len(sessions_db),
+    }
 
 
 @app.post("/agent/init_session")
-async def agent_init_session_endpoint(body: dict = Body(...)):
+async def agent_init_session_endpoint(
+    body: dict = Body(...),
+    current_user=Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
     """创建带预注入上下文的 Agent 会话（无 LLM 调用）。
 
     直接把选型摘要写入会话历史（AIMessage），
@@ -201,64 +380,44 @@ class ClassifyRequest(BaseModel):
     has_active_selection: bool = False
     accumulated_input: str = ""  # 跨轮累积的约束文本（分号分隔）
     thinking_depth: str = "default"
+    session_id: str = _DEFAULT_SESSION_ID
 
 @app.post("/classify")
-async def classify_endpoint(body: ClassifyRequest):
-    """对用户输入进行意图分类。
-
-    返回:
-      {"intent": "selection"|"chat"|"adjustment"|"clarify",
-       "reasoning": "LLM判断理由",
-       "is_in_scope": true/false,
-       ...}
-    """
-    from .intent_classifier import classify, extract_adjustment, get_last_classification
-    from .constraint_checker import extract_constraints, check_completeness, build_clarification_response, merge_constraints
-
-    intent = classify(body.user_input, body.has_active_selection,
-                      accumulated_input=body.accumulated_input)
-    result: dict = {"intent": intent}
-
-    # 附加 LLM 分类详情（reasoning, device_category 等）
-    llm_info = get_last_classification()
-    if llm_info:
-        result["reasoning"] = llm_info.get("reasoning", "")
-        result["device_category"] = llm_info.get("device_category", "")
-
-    if intent == "adjustment":
-        result["adjustments"] = extract_adjustment(body.user_input)
-
-    if intent == "clarify":
-        # 如果有累积的前轮约束文本，合并后重新检查完整性
-        merged_text = body.user_input
-        accumulated = {}
-        if body.accumulated_input:
-            accumulated = extract_constraints(body.accumulated_input)
-            merged_text = f"{body.accumulated_input}; {body.user_input}"
-
-        constraints = extract_constraints(body.user_input)
-        if accumulated:
-            constraints = merge_constraints(accumulated, constraints)
-
-        is_complete, missing_p0, missing_p1 = check_completeness(constraints)
-
-        if is_complete and accumulated:
-            # 合并后完整了 → 升格为 selection
-            result["intent"] = "selection"
-            result["merged_input"] = merged_text  # 传给前端用于选型
-        else:
-            response = build_clarification_response(merged_text, constraints)
-            result["clarify_response"] = response
-            result["missing_p0"] = missing_p0
-            result["missing_p1"] = missing_p1
-
+async def classify_endpoint(
+    body: ClassifyRequest,
+    current_user=Depends(get_current_user),
+):
+    """对用户输入进行意图分类，返回富 dict。"""
+    from .intent_classifier import classify
+    result = classify(
+        body.user_input,
+        has_active_selection=body.has_active_selection,
+        accumulated_input=body.accumulated_input or "",
+    )
+    # selection_choice：需要对比当前会话的选型报告（服务端状态）
+    if result.get("intent") != "selection" and body.has_active_selection:
+        import re as _re
+        if _re.match(r'^\d{1,2}$', body.user_input.strip()):
+            try:
+                _report = _session_reports.get(body.session_id)
+                if _report:
+                    _scored = _report_parts(_report)
+                    _idx = int(body.user_input.strip()) - 1
+                    if 0 <= _idx < len(_scored):
+                        result["intent"] = "selection_choice"
+                        result["selected_part"] = _scored[_idx].part.part_number
+            except (ValueError, TypeError, AttributeError):
+                pass
     return result
 
 
 # ── 流式对话端点（非选型交互用）──────────────────────────────
 
 @app.post("/agent/chat/stream")
-async def agent_chat_stream_endpoint(body: AgentRequest):
+async def agent_chat_stream_endpoint(
+    body: AgentRequest,
+    current_user=Depends(get_current_user),
+):
     """轻量流式对话 — 不触发选型流水线，仅 ReAct Agent 自然语言交互。"""
 
     async def _stream_chat() -> AsyncGenerator[str, None]:
@@ -267,9 +426,31 @@ async def agent_chat_stream_endpoint(body: AgentRequest):
         try:
             from .react_agent import run_agent
             from .intent_classifier import classify
+            from .llm_client import call_openai_chat
+            from .llm_config import get_model
             import json as _json
 
             yield f"event: start\ndata: {_json.dumps({'status': 'agent_thinking'})}\n\n"
+
+            # ── 推理过程展示：预调用 LLM 获取 reasoning_content ────
+            if body.thinking_depth != "off":
+                try:
+                    model = get_model() or "claude-sonnet-5"
+                    reasoning_resp = call_openai_chat(
+                        messages=[{"role": "user", "content": body.user_input}],
+                        model=model,
+                        thinking_depth=body.thinking_depth,
+                    )
+                    rc = reasoning_resp.get("reasoning_content")
+                    if rc:
+                        # 分段发射，每段约 200 字符，让前端逐步显示
+                        chunk_size = 200
+                        for i in range(0, len(rc), chunk_size):
+                            chunk = rc[i:i + chunk_size]
+                            yield f"event: thinking_delta\ndata: {_json.dumps({'stage': 'deepseek', 'text': chunk}, ensure_ascii=False)}\n\n"
+                            await asyncio.sleep(0.02)  # 避免前端一次性接收太多
+                except Exception:
+                    pass  # 推理展示失败不影响主流程
 
             result = run_agent(body.user_input, session_id=body.session_id,
                               thinking_depth=body.thinking_depth)
@@ -315,7 +496,40 @@ async def agent_chat_stream_endpoint(body: AgentRequest):
             elapsed = round(_time.time() - t0, 2)
             yield f"event: done\ndata: {_json.dumps({'elapsed_s': elapsed, 'intent': 'chat'})}\n\n"
         except Exception as e:
-            yield f"event: error\ndata: {_json.dumps({'message': str(e)})}\n\n"
+            # 记录并按情况将下游错误映射到结构化 SSE 事件
+            try:
+                from .log_util import log_error
+                log_error("main.agent_chat_stream", e, "streaming_agent")
+            except Exception:
+                pass
+            msg = str(e)
+            code = None
+            # 根据错误类型返回用户可读的中文提示
+            if "Insufficient Balance" in msg or "402" in msg:
+                code = 402
+                msg = "API 余额不足，请联系管理员充值"
+            elif "invalid_request_error" in msg or "400" in msg:
+                code = 400
+                msg = "模型请求参数错误，请稍后重试"
+            elif "Timeout" in msg or "timed out" in msg.lower():
+                code = 408
+                msg = "模型响应超时，请简化问题后重试"
+            elif "429" in msg or "Rate limit" in msg or "rate_limit" in msg:
+                code = 429
+                msg = "请求过于频繁，请稍候再试"
+            elif "401" in msg or "Unauthorized" in msg:
+                code = 401
+                msg = "API 密钥无效，请联系管理员检查配置"
+            elif "404" in msg:
+                code = 404
+                msg = "模型服务暂不可用，请稍后重试"
+            elif "ConnectionError" in msg or "connection" in msg.lower():
+                code = 503
+                msg = "网络连接异常，请检查网络后重试"
+            payload = {"message": msg}
+            if code:
+                payload["code"] = code
+            yield f"event: error\ndata: {_json.dumps(payload)}\n\n"
 
     return StreamingResponse(
         _stream_chat(),
@@ -324,7 +538,447 @@ async def agent_chat_stream_endpoint(body: AgentRequest):
     )
 
 
-# ── SSE 流式输出端点（B1 任务）──────────────────────────────────────
+# ── 统一流式入口（合并意图分类 + 路由）──────────────────────────────
+
+async def _with_heartbeat(gen: AsyncGenerator[str, None], interval: float = 15.0) -> AsyncGenerator[str, None]:
+    """包装 SSE 生成器，每 interval 秒发送一次 keep-alive 注释，防止浏览器/Nginx 超时断开。"""
+    queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+    _sentinel = object()
+
+    async def _producer():
+        try:
+            async for item in gen:
+                await queue.put(item)
+        finally:
+            await queue.put(_sentinel)
+
+    task = asyncio.create_task(_producer())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=interval)
+                if item is _sentinel:
+                    return
+                yield item
+            except asyncio.TimeoutError:
+                yield ": ping\n\n"
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+async def _stream_agent_chat(body: AgentRequest) -> AsyncGenerator[str, None]:
+    """模块级 Agent 对话流式生成器（供 _stream_unified 复用）。"""
+    import time as _time, json as _json
+    t0 = _time.time()
+    try:
+        from .react_agent import run_agent
+
+        yield f"event: start\ndata: {_json.dumps({'status': 'agent_thinking'})}\n\n"
+
+        # 注入已累积的选型参数作为上下文（避免 LLM 重复追问已给出的参数）
+        sid = body.session_id or _DEFAULT_SESSION_ID
+        accumulated_c = constraint_store.get(sid)
+        context_note = ""
+        if accumulated_c:
+            _t_map = {"buck": "降压", "boost": "升压", "ldo": "线性稳压(LDO)", "buck_boost": "升降压"}
+            param_parts = []
+            if accumulated_c.get("topology"):
+                param_parts.append(f"电路拓扑：{_t_map.get(accumulated_c['topology'], accumulated_c['topology'])}")
+            if accumulated_c.get("input_voltage_nominal_v"):
+                param_parts.append(f"输入电压：{accumulated_c['input_voltage_nominal_v']}V")
+            if accumulated_c.get("output_voltage_v"):
+                param_parts.append(f"输出电压：{accumulated_c['output_voltage_v']}V")
+            if accumulated_c.get("output_current_a"):
+                iout = accumulated_c["output_current_a"]
+                param_parts.append(f"输出电流：{int(iout*1000)}mA" if iout < 1 else f"输出电流：{iout}A")
+            if accumulated_c.get("grade"):
+                g = {"automotive": "车规(AEC-Q100)", "industrial": "工业级", "commercial": "商业级"}
+                param_parts.append(f"等级：{g.get(accumulated_c['grade'], accumulated_c['grade'])}")
+            if param_parts:
+                context_note = (
+                    "[会话已收集的选型参数]\n"
+                    + "\n".join(f"- {p}" for p in param_parts)
+                    + "\n以上参数已记录，不要再次追问，只收集缺少的参数。"
+                )
+
+        # Run synchronous agent in thread pool to avoid blocking the event loop
+        result = await asyncio.to_thread(
+            run_agent, body.user_input,
+            session_id=body.session_id,
+            thinking_depth=body.thinking_depth,
+            context_note=context_note,
+        )
+
+        # Stream thinking content returned from the single LLM call
+        if body.thinking_depth != "off":
+            rc = result.get("reasoning_content") if isinstance(result, dict) else None
+            if rc:
+                for i in range(0, len(rc), 200):
+                    yield f"event: thinking_delta\ndata: {_json.dumps({'stage': 'agent', 'text': rc[i:i+200]}, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(0.01)
+            for tc in (result.get("tool_calls") or []):
+                tool_name = tc.get("tool", "unknown")
+                args_summary = ", ".join(f"{k}={str(v)[:60]}" for k, v in tc.get("args", {}).items())
+                yield f"event: thinking_delta\ndata: {_json.dumps({'stage': 'agent', 'text': f'调用工具：{tool_name}({args_summary})'}, ensure_ascii=False)}\n\n"
+
+        text = ""
+        if isinstance(result, dict):
+            text = result.get("response") or result.get("output") or str(result)
+        else:
+            text = str(result)
+
+        yield f"event: text_delta\ndata: {_json.dumps({'text': text})}\n\n"
+
+        try:
+            from .memory import update_user_name
+            import re as _re
+            name_m = _re.search(r'(?:我是|我叫|叫我|name is|I am|I\'m)\s*[\x80-￿\w]+', body.user_input)
+            if name_m:
+                raw = name_m.group(0)
+                name = _re.sub(r'(?:我是|我叫|叫我|name is|I am|I\'m)\s*', '', raw).strip().rstrip('.,;!。，；！')
+                if name and len(name) <= 10:
+                    update_user_name(name)
+        except Exception:
+            pass
+
+        yield f"event: done\ndata: {_json.dumps({'elapsed_s': round(_time.time() - t0, 2), 'intent': 'chat'})}\n\n"
+
+    except Exception as e:
+        try:
+            from .log_util import log_error
+            log_error("stream_agent_chat", e, "streaming_agent")
+        except Exception:
+            pass
+        msg = str(e)
+        code = None
+        if "Insufficient Balance" in msg or "402" in msg:
+            code, msg = 402, "API 余额不足，请联系管理员充值"
+        elif "Timeout" in msg or "timed out" in msg.lower():
+            code, msg = 408, "模型响应超时，请简化问题后重试"
+        elif "429" in msg or "rate_limit" in msg:
+            code, msg = 429, "请求过于频繁，请稍候再试"
+        elif "401" in msg or "Unauthorized" in msg:
+            code, msg = 401, "API 密钥无效，请联系管理员检查配置"
+        elif "ConnectionError" in msg or "connection" in msg.lower():
+            code, msg = 503, "网络连接异常，请检查网络后重试"
+        payload = {"message": msg}
+        if code:
+            payload["code"] = code
+        yield f"event: error\ndata: {json.dumps(payload)}\n\n"
+
+
+def _build_constraints_text(constraints: dict, original_input: str) -> str:
+    """将累积的结构化约束序列化为自然语言文本，供需求解析器使用。"""
+    parts: list = []
+    t_map = {"buck": "Buck降压", "boost": "Boost升压", "ldo": "LDO线性稳压",
+             "buck_boost": "Buck-Boost"}
+    if constraints.get("topology"):
+        parts.append(t_map.get(constraints["topology"], constraints["topology"]))
+    vin = constraints.get("input_voltage_nominal_v")
+    if vin is None and constraints.get("input_voltage_max_v"):
+        vin = constraints["input_voltage_max_v"]
+    if vin:
+        if constraints.get("input_voltage_min_v") and constraints["input_voltage_min_v"] != vin:
+            parts.append(f"输入电压{constraints['input_voltage_min_v']}V~{vin}V")
+        else:
+            parts.append(f"输入电压{vin}V")
+    if constraints.get("output_voltage_v"):
+        parts.append(f"输出电压{constraints['output_voltage_v']}V")
+    if constraints.get("output_current_a"):
+        iout = constraints["output_current_a"]
+        parts.append(f"输出电流{int(iout * 1000)}mA" if iout < 1 else f"输出电流{iout}A")
+    if constraints.get("temperature_min_c") is not None and constraints.get("temperature_max_c") is not None:
+        parts.append(f"温度范围{constraints['temperature_min_c']}~{constraints['temperature_max_c']}°C")
+    g_map = {"automotive": "车规级AEC-Q100", "industrial": "工业级", "commercial": "商业级"}
+    if constraints.get("grade"):
+        parts.append(g_map.get(constraints["grade"], constraints["grade"]))
+    if constraints.get("package_preference"):
+        parts.append(f"封装{constraints['package_preference']}")
+    if parts:
+        return "，".join(parts) + "。" + original_input
+    return original_input
+
+
+async def _stream_unified(body: AgentRequest, dual_model_enabled: bool = False) -> AsyncGenerator[str, None]:
+    """统一流式入口：在流内部完成意图分类，再路由到相应处理链路。
+
+    事件顺序：
+      start → intent → (selection: cache_hit / stage / parse_done / ... / done)
+                      (chat: thinking_delta / text_delta / done)
+                      (selection_choice / clarify: text_delta / done)
+      error（任意阶段异常时）
+    """
+    import time as _t, json as _j
+    t0 = _t.time()
+    try:
+        yield _yield_sse("start", {"session_id": body.session_id or ""})
+
+        # ── 服务端约束累积（解决多轮参数逐步提供时丢失问题）─────────
+        from .constraint_checker import extract_constraints, merge_constraints, check_completeness
+        from .intent_classifier import _is_fast_chat, _is_fast_adjustment, classify, extract_adjustment
+        import re as _re
+
+        sid = body.session_id or _DEFAULT_SESSION_ID
+
+        # 从 DB 恢复（服务器重启后内存清零时使用）
+        if not constraint_store.contains(sid) and body.session_id:
+            try:
+                import json as _jc
+                from .database import SessionLocal as _SLc
+                from .models_db import ChatSession as _CSc
+                _dbc = _SLc()
+                try:
+                    _cs = _dbc.query(_CSc).filter(_CSc.id == sid).first()
+                    if _cs and getattr(_cs, 'accumulated_constraints', None):
+                        constraint_store.set(sid, _jc.loads(_cs.accumulated_constraints))
+                finally:
+                    _dbc.close()
+            except Exception:
+                pass
+
+        new_c = extract_constraints(body.user_input)
+        accumulated_c = constraint_store.get(sid)
+        merged_c = merge_constraints(accumulated_c, new_c)
+        # Always persist merged state — even if no new params extracted this turn
+        constraint_store.set(sid, merged_c)
+        # 持久化到 DB（重启后不丢失）
+        if body.session_id:
+            try:
+                import json as _jp
+                from .database import SessionLocal as _SLp
+                from .models_db import ChatSession as _CSp
+                _dbp = _SLp()
+                try:
+                    _csp = _dbp.query(_CSp).filter(_CSp.id == sid).first()
+                    if _csp:
+                        _csp.accumulated_constraints = _jp.dumps(merged_c, ensure_ascii=False)
+                        _dbp.commit()
+                finally:
+                    _dbp.close()
+            except Exception:
+                pass
+
+        # ── 意图路由（约束完整性优先，减少独立 LLM 分类调用）────────
+        cls: dict = {"intent": "chat", "merged_input": body.user_input}
+
+        _ORDINAL_MAP = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8}
+
+        def _extract_ordinal(text: str):
+            """从自然语言中提取序号，如"第三个方案"→3，"选2"→2"""
+            m = _re.search(
+                r'(?:选择?|确认|要|用|选用|第)\s*([一二三四五六七八\d])\s*(?:个|号|款|方案|个方案)?',
+                text
+            )
+            if m:
+                raw = m.group(1).strip()
+                return _ORDINAL_MAP.get(raw) or (int(raw) if raw.isdigit() else None)
+            # bare ordinal "第三个"
+            m2 = _re.match(r'^\s*第\s*([一二三四五六七八\d])\s*(?:个|号|款|方案)?', text.strip())
+            if m2:
+                raw = m2.group(1).strip()
+                return _ORDINAL_MAP.get(raw) or (int(raw) if raw.isdigit() else None)
+            return None
+
+        # 1. 数字或自然语言选择（优先级最高）
+        _sel_idx = None
+        if body.has_active_selection:
+            if _re.match(r'^\d{1,2}$', body.user_input.strip()):
+                _sel_idx = int(body.user_input.strip())
+            else:
+                _sel_idx = _extract_ordinal(body.user_input)
+
+        if _sel_idx is not None:
+            try:
+                _report = _session_reports.get(sid)
+                if _report:
+                    _scored = _report_parts(_report)
+                    _idx = _sel_idx - 1
+                    if 0 <= _idx < len(_scored):
+                        cls = {"intent": "selection_choice",
+                               "selected_part": _scored[_idx].part.part_number}
+            except (ValueError, TypeError, AttributeError):
+                pass
+
+        # 2. 出域快速拦截（在 fast_chat 之前，避免被快速路径绕过）
+        if cls["intent"] == "chat" and _sel_idx is None:
+            from .intent_classifier import _is_out_of_scope, _OUT_OF_SCOPE_REPLY
+            if _is_out_of_scope(body.user_input):
+                cls = {"intent": "out_of_scope", "clarify_response": _OUT_OF_SCOPE_REPLY}
+
+        # 2b. 身份问题快速拦截（直接返回固定回复，防止底层模型泄露身份）
+        _IDENTITY_PATTERNS = ("你是谁", "你是什么", "你叫什么", "你是claude", "你是ai",
+                               "who are you", "what are you", "你是gpt", "你是哪家",
+                               "谁开发的", "你是什么ai", "介绍一下你自己", "自我介绍")
+        _t_lower = body.user_input.strip().lower()
+        if cls["intent"] == "chat" and any(p in _t_lower for p in _IDENTITY_PATTERNS):
+            yield _yield_sse("intent", {"intent": "chat", "confidence": 1.0})
+            yield _yield_sse("text_delta", {"text": "我是 eZmanbo，智能电子元器件选型助理，专注于电源管理 IC、DC-DC 转换器、LDO 等元器件的选型与评估。"})
+            yield _yield_sse("done", {"elapsed_s": 0.0, "intent": "chat"})
+            return
+
+        # 3. 纯问候/对话快速路径（无需参数）
+        if cls["intent"] == "chat" and _is_fast_chat(body.user_input) and _sel_idx is None:
+            cls = {"intent": "chat"}
+
+        # 3. 调整指令（有活跃选型结果时）
+        elif cls["intent"] == "chat" and body.has_active_selection and _is_fast_adjustment(body.user_input):
+            cls = {"intent": "adjustment",
+                   "adjustments": extract_adjustment(body.user_input)}
+
+        # 4. 基于累积约束完整性判断（主路径：消除冗余 LLM 分类调用）
+        elif cls["intent"] == "chat" and merged_c:
+            is_complete, missing_p0, missing_p1 = check_completeness(merged_c)
+            if is_complete:
+                cls = {"intent": "selection", "merged_input": body.user_input, "missing_p1": missing_p1}
+            else:
+                cls = {"intent": "clarify", "missing_p0": missing_p0}
+
+        # 5. 兜底：LLM 分类（处理纯描述性问题、模糊意图等）
+        else:
+            cls = classify(
+                body.user_input,
+                has_active_selection=body.has_active_selection,
+                accumulated_input=body.accumulated_input or "",
+                session_id=sid,
+            )
+
+        intent: str = cls.get("intent", "chat")
+
+        yield _yield_sse("intent", {
+            "intent": intent,
+            "selected_part": cls.get("selected_part"),
+            "merged_input": cls.get("merged_input"),
+            "clarify_response": cls.get("clarify_response"),
+            "adjustments": cls.get("adjustments"),
+            "no_spec_params": cls.get("no_spec_params"),
+            "confidence": cls.get("confidence", 1.0),
+        })
+
+        # ── 数字选择：器件确认 ─────────────────────────────────────
+        if intent == "selection_choice" and cls.get("selected_part"):
+            pn = cls["selected_part"]
+            sid = body.session_id or _DEFAULT_SESSION_ID
+            _session_selected_part[sid] = pn
+            yield _yield_sse("done", {
+                "elapsed_s": round(_t.time() - t0, 2),
+                "intent": "selection_choice",
+                "selected_part": pn,
+            })
+            return
+
+        # ── 参数澄清：LLM 生成自然回复，显示已收集的参数避免重复追问 ──
+        if intent == "clarify":
+            from .constraint_checker import build_clarification_response
+            clarify_text, updated_c = await asyncio.to_thread(
+                build_clarification_response, body.user_input, merged_c  # pass merged_c, not just accumulated_c
+            )
+            # Merge updated_c INTO merged_c to avoid overwriting already-collected params
+            if updated_c:
+                final_c = merge_constraints(merged_c, updated_c)
+                constraint_store.set(sid, final_c)
+            missing_p0_fields = list(cls.get("missing_p0") or [])
+            accumulated_for_sse = merge_constraints(merged_c, updated_c) if updated_c else merged_c
+            yield _yield_sse("clarify_fields", {"missing_p0": missing_p0_fields, "accumulated": accumulated_for_sse or {}})
+            yield _yield_sse("text_delta", {"text": clarify_text})
+            yield _yield_sse("done", {"elapsed_s": round(_t.time() - t0, 2), "intent": "clarify"})
+            return
+
+        # ── 选型 / 调整：完整分析流水线 ────────────────────────────
+        if intent in ("selection", "adjustment"):
+            # 优先使用服务端累积的结构化约束重建完整分析文本
+            if merged_c and intent == "selection":
+                merged = _build_constraints_text(merged_c, body.user_input)
+                constraint_store.pop(sid)  # 选型触发后清空累积
+            else:
+                merged = cls.get("merged_input") or (
+                    f"{body.accumulated_input}; {body.user_input}"
+                    if body.accumulated_input else body.user_input
+                )
+            analyze_body = AnalyzeRequest(
+                user_input=merged,
+                thinking_depth=body.thinking_depth,
+                session_id=body.session_id,
+                pre_constraints=merged_c if intent == "selection" and merged_c else None,
+                skip_cache=(intent == "adjustment"),
+            )
+            async for ev in _stream_analyze(analyze_body, dual_model_enabled=dual_model_enabled):
+                yield ev
+
+            # P1-2: 选型完成后，如果有缺失的 P1 字段，追问以优化后续结果
+            if intent == "selection" and cls.get("missing_p1"):
+                from .constraint_checker import generate_clarification_questions
+                p1_questions = generate_clarification_questions([], cls["missing_p1"])
+                if p1_questions:
+                    yield _yield_sse("p1_followup", {
+                        "questions": p1_questions,
+                        "hint": "补充以下信息可进一步优化选型结果："
+                    })
+            return
+
+        # ── 出域请求：直接返回固定拒绝文本，不进 Agent ────────────
+        if intent == "out_of_scope":
+            reply = cls.get("clarify_response") or "抱歉，我只能协助电子元器件选型相关问题。如需选型，请描述您的电压/电流/拓扑需求。"
+            yield _yield_sse("text_delta", {"text": reply})
+            yield _yield_sse("done", {"elapsed_s": round(_t.time() - t0, 2), "intent": "out_of_scope"})
+            return
+
+        # ── 其他（chat / replacement / general）: Agent 对话 ──────
+        async for ev in _stream_agent_chat(body):
+            yield ev
+
+    except Exception as e:
+        try:
+            from .log_util import log_error
+            log_error("stream_unified", e, "streaming_unified")
+        except Exception:
+            pass
+        yield _yield_sse("error", {"message": str(e)})
+
+
+@app.post("/chat/stream")
+async def chat_stream_endpoint(
+    body: AgentRequest,
+    current_user=Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
+    """统一流式对话端点：意图分类 + 路由均在服务端完成，前端单连接处理所有场景。"""
+    async def _gen():
+        async for ev in _stream_unified(body, dual_model_enabled=bool(getattr(current_user, 'dual_model_enabled', False))):
+            yield ev
+        # DB 持久化（游客跳过）
+        if not getattr(current_user, "is_guest", False):
+            try:
+                sid = body.session_id or _DEFAULT_SESSION_ID
+                session_db = db.query(ChatSessionDB).filter(
+                    ChatSessionDB.id == sid, ChatSessionDB.user_id == current_user.id
+                ).first()
+                if not session_db:
+                    session_db = ChatSessionDB(id=sid, user_id=current_user.id, title="新的对话")
+                    db.add(session_db)
+                db.add(ChatMessageDB(session_id=sid, role="user", content=body.user_input[:10000]))
+                db.commit()
+                # P0-3: first message — session just created, persist any already-accumulated constraints
+                if constraint_store.contains(sid) and not getattr(session_db, "accumulated_constraints", None):
+                    import json as _jfix
+                    session_db.accumulated_constraints = _jfix.dumps(
+                        constraint_store.get(sid), ensure_ascii=False
+                    )
+                    db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+
+    return StreamingResponse(
+        _with_heartbeat(_gen()),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 def _build_interaction_prompt(report) -> str:
     """选型完成后生成交互引导文案。"""
@@ -345,98 +999,31 @@ def _build_interaction_prompt(report) -> str:
     return f"""
 ---
 
-### 下一步操作
+> 共筛选出 **{total_count}** 个候选器件，首选推荐 **#{1} {pn}**（{mfr}），综合评分 **{score}** 分。
 
-> 首选推荐：**#{1} {pn}**（{mfr}），综合评分 **{score} 分**，整体风险 **{risk.upper()}**
-
-共 **{total_count}** 条候选器件（编号见上方列表）。请选择：
-
-- **选择器件** — 输入编号（如 `1`）确认首选，系统将生成该器件的完整报告（BOM + 风险评估）
-- **调整需求** — 输入修改后的参数（如 `输出电流改为 5A`、`换国产器件`）重新选型
-- **导出 BOM** — 输入 `/export` 下载完整 BOM Excel 清单
-- **查看报告** — 点击下方「查看报告」按钮浏览 BOM / 风险评估报告
-
-> 💡 也可直接描述你的想法，如 _"就选第 1 款"_、_"有没有国产替代"_、_"帮我对比 #2 和 #3"_"""
+请回复编号（如 `1`）选定器件，或告诉我需要调整哪些参数。"""
 
 
 def _rebuild_summary_from_cached_dict(cached_report: dict) -> str:
-    """从缓存字典重建完整候选列表摘要（代替旧格式的 summary_markdown）。"""
-    candidates = cached_report.get("candidates", [])
-    user_input = cached_report.get("user_input", "")
+    """从缓存结果生成简洁的自然语言摘要（不使用模板表格）。"""
+    # candidates 优先，兼容旧缓存中 scored_parts 字段名
+    candidates = (cached_report.get("candidates") or
+                  cached_report.get("scored_parts") or [])
     recommended = [c for c in candidates
                    if (c.get("recommendation_level") if isinstance(c, dict) else None) == "recommended"]
-    backup = [c for c in candidates
-              if (c.get("recommendation_level") if isinstance(c, dict) else None) == "backup"]
-
-    lines = [
-        "## 选型报告（缓存命中）",
-        "",
-        f"**需求**：{user_input}",
-        "",
-        f"**检索结果**：共 {len(candidates)} 条候选，"
-        f"**{len(recommended)} 条推荐**，{len(backup)} 条备选。",
-    ]
-
-    def _fmt_part(idx: int, c: dict) -> list[str]:
-        p = c.get("part", {}) if isinstance(c, dict) else {}
-        s = c.get("score", {}) if isinstance(c, dict) else {}
-        pn  = p.get("part_number", "?") if isinstance(p, dict) else "?"
-        mfr = p.get("manufacturer", "—") if isinstance(p, dict) else "—"
-        pkg = p.get("package", "") if isinstance(p, dict) else ""
-        pkg_str = f" / {pkg}" if pkg else ""
-        dom = " 🇨🇳" if (p.get("is_domestic") if isinstance(p, dict) else False) else ""
-        total = int(s.get("total_score", 0)) if isinstance(s, dict) else 0
-        param = int(s.get("parameter_match_score", 0)) if isinstance(s, dict) else 0
-        supply = int(s.get("supply_risk_score", 0)) if isinstance(s, dict) else 0
-        cost  = int(s.get("cost_score", 0)) if isinstance(s, dict) else 0
-        dom_sc = int(s.get("domestic_score", 0)) if isinstance(s, dict) else 0
-        out = [
-            f"**#{idx}** `{pn}`{dom}  —  {mfr}{pkg_str}",
-            f"- 综合得分：**{total}**（参数 {param} | 供应 {supply} | 成本 {cost} | 国产 {dom_sc}）",
-        ]
-        reasons = s.get("reasons", []) if isinstance(s, dict) else []
-        good = [r for r in reasons if "✓" in r or "满足" in r][:2]
-        for r in good:
-            out.append(f"  - {r}")
-        out.append("")
-        return out
-
     if recommended:
-        lines += ["", f"### 推荐器件（{len(recommended)} 条）", ""]
-        for i, c in enumerate(recommended, start=1):
-            lines.extend(_fmt_part(i, c))
-
-    if backup:
-        lines += [f"### 备选器件（{len(backup)} 条）", ""]
-        start = len(recommended) + 1
-        for i, c in enumerate(backup, start=start):
-            p = c.get("part", {}) if isinstance(c, dict) else {}
-            s = c.get("score", {}) if isinstance(c, dict) else {}
-            pn  = p.get("part_number", "?") if isinstance(p, dict) else "?"
-            mfr = p.get("manufacturer", "—") if isinstance(p, dict) else "—"
-            total = int(s.get("total_score", 0)) if isinstance(s, dict) else 0
-            param = int(s.get("parameter_match_score", 0)) if isinstance(s, dict) else 0
-            supply = int(s.get("supply_risk_score", 0)) if isinstance(s, dict) else 0
-            dom = " 🇨🇳" if (p.get("is_domestic") if isinstance(p, dict) else False) else ""
-            lines.append(
-                f"**#{i}** `{pn}`{dom}  —  {mfr}"
-                f"  综合得分 **{total}**（参数 {param} | 供应 {supply}）"
-            )
-        lines.append("")
-
-    risks = cached_report.get("risks", {})
-    if isinstance(risks, dict):
-        lvl = risks.get("overall_risk_level", "?")
-        supply_sum = risks.get("supply_risk_summary", "")
-        eng_sum = risks.get("engineering_risk_summary", "")
-        risk_emoji = {"high": "⚠", "medium": "△", "low": "✓"}.get(lvl, "?")
-        lines += [
-            f"**整体风险**：{risk_emoji} {lvl.upper()}",
-            f"- 供应链：{supply_sum}",
-            f"- 工程：{eng_sum}",
-        ]
-
-    return "\n".join(lines)
+        r0 = recommended[0]
+        p = r0.get("part", {}) if isinstance(r0, dict) else {}
+        s = r0.get("score", {}) if isinstance(r0, dict) else {}
+        pn = p.get("part_number", "?") if isinstance(p, dict) else "?"
+        mfr = p.get("manufacturer", "") if isinstance(p, dict) else ""
+        score = int(s.get("total_score", 0)) if isinstance(s, dict) else 0
+        return (
+            f"（缓存结果）共 {len(candidates)} 款候选器件，"
+            f"首选推荐 **{pn}**（{mfr}，综合评分 {score} 分）。"
+            "详细评分请在右侧面板查看，也可告诉我选第1款或换国产替代。"
+        )
+    return f"（缓存结果）共 {len(candidates)} 款候选器件，详细评分请在右侧面板查看。"
 
 
 def _safe_serialize(obj):
@@ -457,17 +1044,53 @@ def _yield_sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(_safe_serialize(data), ensure_ascii=False)}\n\n"
 
 
+def _report_parts(report):
+    """Return the current report's complete candidate collection.
+
+    SelectionReport uses ``candidates`` as its canonical field. The fallback
+    keeps old persisted/cache payloads readable without reviving ``scored_parts``
+    as a public schema field.
+    """
+    if isinstance(report, dict):
+        return report.get("candidates") or report.get("recommended_parts") or report.get("scored_parts") or []
+    return (getattr(report, "candidates", None)
+            or getattr(report, "recommended_parts", None)
+            or getattr(report, "scored_parts", None)
+            or [])
+
+
+def _part_number(scored_part):
+    if isinstance(scored_part, dict):
+        part = scored_part.get("part") or scored_part
+        return part.get("part_number", "") if isinstance(part, dict) else ""
+    return getattr(getattr(scored_part, "part", None), "part_number", "")
+
+
 # ═══════════════════════════════════════════════════════════════════
 # 阶段子函数（拆分自 _stream_analyze，降低圈复杂度）
 # 每个函数返回 (结果, sse_events_list)
 # ═══════════════════════════════════════════════════════════════════
 
 async def _stream_stage1_parse(req: AnalyzeRequest, loop) -> tuple:
-    """Stage 1：需求解析 → (requirement, events)"""
+    """Stage 1：需求解析 → (requirement, events)
+
+    快速路径：若 req.pre_constraints 已由上游填充，直接构建 RequirementConstraints 跳过 LLM 调用。
+    """
     events: list = []
     events.append(_yield_sse("stage", {"stage": "parse", "status": "started"}))
     from .requirement_parser import parse_requirement
-    requirement = await loop.run_in_executor(None, parse_requirement, req.user_input)
+
+    if req.pre_constraints:
+        # 快速路径：多轮累积的结构化约束已完整，无需额外 LLM 解析
+        from .schemas import RequirementConstraints as _RC
+        try:
+            requirement = _RC(raw_input=req.user_input, **{
+                k: v for k, v in req.pre_constraints.items() if v is not None
+            })
+        except Exception:
+            requirement = await loop.run_in_executor(None, parse_requirement, req.user_input)
+    else:
+        requirement = await loop.run_in_executor(None, parse_requirement, req.user_input)
     events.append(_yield_sse("parse_done", {
         "status": "需求解析完成",
         "constraints": _safe_serialize(requirement),
@@ -503,18 +1126,22 @@ async def _stream_stage2_search(req: AnalyzeRequest, requirement, loop) -> tuple
     """Stage 2：器件搜索 + 详情富化 + 候选放宽 → (candidates, events)"""
     events: list = []
     events.append(_yield_sse("stage", {"stage": "search", "status": "started"}))
-    from .ezplm_client import search_parts, enrich_candidates_with_details
-    candidates = await loop.run_in_executor(None, search_parts, requirement)
+    from .multi_agent import parallel_search_parts, parallel_enrich_candidates
+    events.append(_yield_sse("agent_activity", {
+        "agent": "SearchOrchestrator", "status": "启动并行搜索", "phase": "search",
+        "detail": "多 SearchAgent 并发查询 eZ-PLM",
+    }))
+    candidates = await parallel_search_parts(requirement)
     events.append(_yield_sse("search_done", {
         "status": "搜索完成",
         "candidate_count": len(candidates),
         "sources": list(set(getattr(c, "source", "unknown") for c in candidates)),
     }))
     if candidates:
-        candidates = await loop.run_in_executor(
-            None,
-            lambda: enrich_candidates_with_details(candidates, max_enrich=6),
-        )
+        events.append(_yield_sse("agent_activity", {
+            "agent": "EnrichOrchestrator", "status": "并行富化器件详情", "phase": "enrich",
+        }))
+        candidates = await parallel_enrich_candidates(candidates, max_enrich=6)
     if req.thinking_depth != "off":
         if candidates:
             mfrs = list(dict.fromkeys(
@@ -540,7 +1167,7 @@ async def _stream_stage2_search(req: AnalyzeRequest, requirement, loop) -> tuple
             "stage": "search",
             "status": f"candidates<3, relaxing Iout {old_iout}A->{requirement.output_current_a}A",
         }))
-        candidates = await loop.run_in_executor(None, search_parts, requirement)
+        candidates = await parallel_search_parts(requirement)
         requirement.output_current_a = old_iout
     return candidates, events
 
@@ -636,6 +1263,7 @@ async def _stream_stage5_risk(req: AnalyzeRequest, requirement, scored, loop) ->
         "low": sum(1 for r in risks.risk_items if r.severity == "low"),
         "supply_summary": risks.supply_risk_summary,
         "engineering_summary": risks.engineering_risk_summary,
+        "risk_items": [r.dict() for r in risks.risk_items],
     }))
     if req.thinking_depth != "off":
         high_c = sum(1 for r in risks.risk_items if r.severity == "high")
@@ -660,23 +1288,111 @@ async def _stream_stage5_risk(req: AnalyzeRequest, requirement, scored, loop) ->
 
 
 async def _stream_stage6_report(req: AnalyzeRequest, requirement, scored, evidence, risks,
-                                 t_start: float, loop) -> tuple:
+                                 t_start: float, loop, dual_model_enabled: bool = False) -> tuple:
     """Stage 6+7：报告生成 + 完成事件 → (events, report)"""
     events: list = []
     events.append(_yield_sse("stage", {"stage": "report", "status": "started"}))
     from .report_generator import build_report
     report = await loop.run_in_executor(None, build_report, requirement, scored, evidence)
     sid = req.session_id or _DEFAULT_SESSION_ID
+    _evict_session_stores()  # P0-4: prevent unbounded growth
     _session_reports[sid] = report
     _session_constraints[sid] = requirement
+
+    # ── 参考设计获取（并行，Top-5 推荐器件）───────────────────────
+    try:
+        from .multi_agent import parallel_fetch_ref_designs_from_scored
+        rd_map = await parallel_fetch_ref_designs_from_scored(report.recommended_parts or [])
+        ref_designs: list = []
+        for sp in (report.recommended_parts or [])[:5]:
+            for rd in rd_map.get(sp.part.part_number, [])[:2]:
+                ref_designs.append({
+                    "part_number": sp.part.part_number,
+                    "design_name": rd.get("name") or rd.get("title", "参考设计"),
+                    "description": (rd.get("description") or "")[:200],
+                    "url": rd.get("url") or rd.get("link", ""),
+                })
+        if ref_designs:
+            report.reference_designs = ref_designs
+            events.append(_yield_sse("reference_designs", {
+                "designs": ref_designs,
+                "count": len(ref_designs),
+            }))
+    except Exception:
+        pass
     if report.summary_markdown:
-        for line in report.summary_markdown.split('\n'):
-            if line.strip():
-                events.append(_yield_sse("text_delta", {"text": line}))
-    interaction_text = _build_interaction_prompt(report)
-    for line in interaction_text.split('\n'):
-        if line.strip():
-            events.append(_yield_sse("text_delta", {"text": line}))
+        # Only send a brief natural-language summary, not the full markdown table
+        recs = report.recommended_parts or []
+        if recs:
+            top = recs[0]
+            pn = getattr(getattr(top, 'part', None), 'part_number', '?') or '?'
+            score = int(getattr(getattr(top, 'score', None), 'total_score', 0) or 0)
+            total = len(report.candidates or [])
+            risk = getattr(risks, 'overall_risk_level', '').upper() or 'UNKNOWN'
+            brief = (
+                f"已完成选型分析，共找到 **{total}** 款候选器件。"
+                f"首选推荐 **{pn}**（综合评分 {score} 分，整体风险 {risk}）。"
+                f"完整评分明细和器件对比请在右侧面板查看。"
+            )
+            events.append(_yield_sse("text_delta", {"text": brief}))
+
+    # ── 双模型验证（仅当用户已开启且管理员已配置验证模型时执行）──────
+    try:
+        from .dual_model_verify import verify_selection
+        recs_for_verify = report.recommended_parts or []
+        risk_level = getattr(risks, 'overall_risk_level', 'medium') or 'medium'
+        top_scores = [float(getattr(getattr(sp, 'score', None), 'total_score', 0) or 0) for sp in recs_for_verify[:2]]
+        score_delta_top2 = (top_scores[0] - top_scores[1]) if len(top_scores) >= 2 else 20.0
+        should_verify = dual_model_enabled and bool(recs_for_verify) and not (risk_level == 'low' and score_delta_top2 > 10)
+        if should_verify:
+            primary_pn = getattr(getattr(recs_for_verify[0], 'part', None), 'part_number', '') or ''
+            req_text = str(getattr(requirement, 'user_input', '') or '')
+            cands_flat = []
+            for sp in recs_for_verify[:8]:
+                p = getattr(sp, 'part', None)
+                s = getattr(sp, 'score', None)
+                cands_flat.append({
+                    "part_number": getattr(p, 'part_number', '?') or '?',
+                    "manufacturer": getattr(p, 'manufacturer', '') or '',
+                    "total_score": float(getattr(s, 'total_score', 0) or 0),
+                })
+            verify_result = await verify_selection(
+                req_text, cands_flat, primary_pn, risk_level,
+                primary_full_response=brief if 'brief' in dir() else "",
+            )
+            events.append(_yield_sse("dual_verify", {
+                "passed": verify_result.passed,
+                "primary_top": verify_result.primary_top,
+                "verifier_top": verify_result.verifier_top,
+                "agreement": verify_result.agreement,
+                "score_delta": verify_result.score_delta,
+                "needs_human_review": verify_result.needs_human_review,
+                "notes": verify_result.verifier_notes,
+                "verifier_full_response": verify_result.verifier_full_response,
+                "judgment_reasoning": verify_result.judgment_reasoning,
+            }))
+            # Emit formatted comparison text when models disagree
+            if not verify_result.agreement or verify_result.risk_conflict:
+                comparison_text = (
+                    "\n\n---\n**🔍 双模型验证结果（存在分歧）**\n\n"
+                    f"**模型A（主模型）推荐：** {verify_result.primary_top}\n\n"
+                    f"**模型B（验证模型）推荐：** {verify_result.verifier_top}\n\n"
+                    f"**验证模型说明：** {verify_result.verifier_full_response}\n\n"
+                )
+                if verify_result.judgment_reasoning:
+                    comparison_text += f"**裁判判断：** {verify_result.judgment_reasoning}\n"
+                events.append(_yield_sse("text_delta", {"text": comparison_text}))
+            else:
+                events.append(_yield_sse("text_delta", {"text": f"\n\n✅ **双模型验证通过**：两个模型均推荐 **{verify_result.primary_top}**，结果一致。"}))
+    except Exception:
+        pass
+
+    # ── 知识库自动写入（异步，不阻塞）──────────────────────────────
+    try:
+        from .kb_updater import auto_ingest_from_report
+        await asyncio.to_thread(auto_ingest_from_report, report.dict())
+    except Exception:
+        pass
     elapsed = round(time.time() - t_start, 2)
     events.append(_yield_sse("done", {
         "status": "分析完成",
@@ -686,11 +1402,13 @@ async def _stream_stage6_report(req: AnalyzeRequest, requirement, scored, eviden
         "candidate_count": len(report.candidates),
         "overall_risk": risks.overall_risk_level,
         "summary": report.summary_markdown or "",
+        "recommended_parts": [p.dict() for p in report.recommended_parts],
+        "candidates": [p.dict() for p in report.candidates],
     }))
     return events, report
 
 
-async def _stream_analyze(req: AnalyzeRequest) -> AsyncGenerator[str, None]:
+async def _stream_analyze(req: AnalyzeRequest, dual_model_enabled: bool = False) -> AsyncGenerator[str, None]:
     """异步生成器：按阶段推送 SSE 事件（含 B4 语义缓存集成）。
 
     各阶段已拆分为独立子函数：parse → search → score → evidence → risk → report。
@@ -699,17 +1417,35 @@ async def _stream_analyze(req: AnalyzeRequest) -> AsyncGenerator[str, None]:
     loop = asyncio.get_running_loop()
 
     try:
-        # ── B4：语义缓存层检查 ──────────────────────────────────
-        from .semantic_cache import get_semantic_cache
+        # ── B4：结构化选型缓存检查（必须先解析约束，禁止原始文本近邻命中）──
+        from .semantic_cache import get_semantic_cache, canonical_constraint_fingerprint
         cache = get_semantic_cache()
-        cache_result = cache.get(req.user_input)
 
+        requirement, events = await _stream_stage1_parse(req, loop)
+        for ev in events:
+            yield ev
+
+        fingerprint = canonical_constraint_fingerprint(requirement)
+        cache_result = cache.get_exact(fingerprint) if fingerprint and not req.skip_cache else None
+        cached_report = cache_result.get("cached_result", {}) if cache_result else {}
+        restored_report = None
         if cache_result is not None:
+            from .schemas import SelectionReport as _SelectionReport
+            try:
+                restored_report = _SelectionReport(**cached_report)
+            except Exception:
+                cache_result = None
+                yield _yield_sse("cache_hit", {"hit": False, "reason": "invalid_cached_report"})
+
+        if cache_result is not None and restored_report is not None:
             elapsed = round(time.time() - t_start, 2)
             yield _yield_sse("cache_hit", {"hit": True, "similarity": cache_result.get("similarity", 0)})
-            cached_report = cache_result.get("cached_result", {})
+            sid = req.session_id or _DEFAULT_SESSION_ID
+            _evict_session_stores()
+            _session_reports[sid] = restored_report
+            _session_constraints[sid] = restored_report.constraints
 
-            scored = cached_report.get("scored_parts", []) or cached_report.get("candidates", [])
+            scored = cached_report.get("candidates", []) or cached_report.get("recommended_parts", [])
             for i, s in enumerate(scored):
                 part = s.get("part", {}) if isinstance(s, dict) else getattr(s, "part", None)
                 score = s.get("score", {}) if isinstance(s, dict) else getattr(s, "score", None)
@@ -743,25 +1479,12 @@ async def _stream_analyze(req: AnalyzeRequest) -> AsyncGenerator[str, None]:
                 total_score = int(score.get("total_score", 0)) if isinstance(score, dict) else 0
                 risks = cached_report.get("risks", {})
                 risk_level = (risks.get("overall_risk_level", "?") if isinstance(risks, dict) else "?").upper()
-                interaction_text = f"""
----
-
-### 下一步操作
-
-> 首选推荐：**#1 {pn}**（{mfr}），综合评分 **{total_score} 分**，整体风险 **{risk_level}**
-
-共 **{total_count}** 条候选器件（编号见上方列表）。请选择：
-
-- **选择器件** — 输入编号（如 `1`）确认首选，系统将生成该器件的完整报告（BOM + 风险评估）
-- **调整需求** — 输入修改后的参数（如 `输出电流改为 5A`、`换国产器件`）重新选型
-- **导出 BOM** — 输入 `/export` 下载完整 BOM Excel 清单
-- **查看报告** — 点击下方「查看报告」按钮浏览 BOM / 风险评估报告
-
-> 💡 也可直接描述你的想法，如 _"就选第 1 款"_、_"有没有国产替代"_、_"帮我对比 #2 和 #3"_
-"""
-                for line in interaction_text.split('\n'):
-                    if line.strip():
-                        yield _yield_sse("text_delta", {"text": line})
+                interaction_text = (
+                    f"已为您找到 **{total_count}** 款候选器件，首选推荐 **{pn}**"
+                    f"（{mfr}，综合评分 **{total_score} 分**）。"
+                    "详细评分和对比请在右侧面板查看，也可以直接告诉我您的想法。"
+                )
+                yield _yield_sse("text_delta", {"text": interaction_text})
 
             rec_count = len(cached_report.get("recommended_parts", []))
             risk_val = cached_report.get("risks", {})
@@ -770,24 +1493,62 @@ async def _stream_analyze(req: AnalyzeRequest) -> AsyncGenerator[str, None]:
             else:
                 overall = getattr(risk_val, "overall_risk_level", "?")
 
+            # 缓存命中路径此前跳过了 risk_done / evidence_done 事件，
+            # 导致前端属性面板的"风险"/"证据"栏拿不到数据（即使候选列表已展示）。
+            if isinstance(risk_val, dict) and risk_val:
+                risk_items = risk_val.get("risk_items", []) or []
+                yield _yield_sse("risk_done", {
+                    "status": "风险评估完成（缓存）",
+                    "overall_risk_level": risk_val.get("overall_risk_level", "low"),
+                    "risk_count": len(risk_items),
+                    "high": sum(1 for r in risk_items if (r or {}).get("severity") == "high"),
+                    "medium": sum(1 for r in risk_items if (r or {}).get("severity") == "medium"),
+                    "low": sum(1 for r in risk_items if (r or {}).get("severity") == "low"),
+                    "supply_summary": risk_val.get("supply_risk_summary"),
+                    "engineering_summary": risk_val.get("engineering_risk_summary"),
+                    "risk_items": risk_items,
+                })
+
+            cached_evidence = cached_report.get("evidence", []) or []
+            evidence_items = []
+            for item in cached_evidence:
+                if not isinstance(item, dict):
+                    continue
+                evidence_items.append({
+                    "part_number": item.get("part_number", ""),
+                    "claim": item.get("claim", ""),
+                    "evidence_type": item.get("evidence_type", ""),
+                    "source_field": item.get("source_field", ""),
+                    "confidence": item.get("confidence", 0.0),
+                    "need_human_review": item.get("need_human_review", False),
+                })
+            avg_confidence = (
+                round(sum(float(item.get("confidence", 0) or 0) for item in evidence_items) / len(evidence_items), 3)
+                if evidence_items else 0.0
+            )
+            yield _yield_sse("evidence_done", {
+                "status": "证据链构建完成（缓存）",
+                "evidence_count": len(evidence_items),
+                "avg_confidence": avg_confidence,
+                "evidence_items": evidence_items,
+            })
+
             yield _yield_sse("done", {
                 "status": "分析完成（语义缓存命中）",
                 "elapsed_s": elapsed,
                 "request_id": cached_report.get("request_id", "cached"),
                 "recommended_count": rec_count,
-                "candidate_count": len(cached_report.get("candidates", [])),
+                "candidate_count": len(cached_report.get("candidates") or cached_report.get("scored_parts") or []),
                 "overall_risk": overall,
                 "summary": summary,
                 "cache_hit": True,
+                "recommended_parts": cached_report.get("recommended_parts", []),
+                "candidates": (cached_report.get("candidates") or
+                               cached_report.get("scored_parts") or []),
             })
             return
 
         yield _yield_sse("cache_hit", {"hit": False})
-
-        # ── Stage 1：需求解析 ──────────────────────────────────
-        requirement, events = await _stream_stage1_parse(req, loop)
-        for ev in events:
-            yield ev
 
         # ── Stage 2：器件搜索 ──────────────────────────────────
         candidates, events = await _stream_stage2_search(req, requirement, loop)
@@ -799,9 +1560,48 @@ async def _stream_analyze(req: AnalyzeRequest) -> AsyncGenerator[str, None]:
         for ev in events:
             yield ev
 
-        # ── Stage 4：证据构建 ──────────────────────────────────
-        evidence, events = await _stream_stage4_evidence(req, scored, requirement, loop)
-        for ev in events:
+        # ── 生命周期告警（并发查询替代料）────────────────────────
+        lc_alerts = []
+        for sp in scored[:10]:
+            lc = (sp.part.lifecycle_status or "").lower().strip()
+            if lc in ("nrnd", "ltb", "eol", "obsolete", "discontinued"):
+                severity = "HIGH" if lc in ("eol", "obsolete", "discontinued") else "MEDIUM"
+                lc_alerts.append({
+                    "part_number": sp.part.part_number,
+                    "manufacturer": sp.part.manufacturer or "",
+                    "lifecycle_status": sp.part.lifecycle_status,
+                    "severity": severity,
+                    "alternatives": [],
+                })
+        if lc_alerts:
+            from .multi_agent import parallel_lifecycle_replacements
+            lc_alerts = await parallel_lifecycle_replacements(lc_alerts)
+            yield _yield_sse("lifecycle_alert", {
+                "alerts": lc_alerts,
+                "count": len(lc_alerts),
+                "has_high": any(a["severity"] == "HIGH" for a in lc_alerts),
+            })
+            if req.thinking_depth != "off":
+                high_parts = [a["part_number"] for a in lc_alerts if a["severity"] == "HIGH"]
+                if high_parts:
+                    yield _yield_sse("thinking_delta", {
+                        "stage": "lifecycle",
+                        "text": f"⚠ 发现 {len(high_parts)} 个已停产/EOL 器件：{', '.join(high_parts)}，已并发查询替代料",
+                    })
+
+        # ── Stages 4+5：证据构建 + 风险评估（并发）────────────────
+        yield _yield_sse("agent_activity", {
+            "agent": "AnalysisOrchestrator",
+            "status": "EvidenceAgent + RiskAgent 并发运行",
+            "phase": "analysis",
+        })
+        (evidence, ev4), (risks, ev5) = await asyncio.gather(
+            _stream_stage4_evidence(req, scored, requirement, loop),
+            _stream_stage5_risk(req, requirement, scored, loop),
+        )
+        for ev in ev4:
+            yield ev
+        for ev in ev5:
             yield ev
 
         # ── P1/P5: CriticNode 自省检查 ─────────────────────
@@ -811,20 +1611,26 @@ async def _stream_analyze(req: AnalyzeRequest) -> AsyncGenerator[str, None]:
         if not critic_result.get("critic_passed"):
             yield _yield_sse("warning", {"message": f"Critic: {critic_result.get('error', '')}"})
 
-        # ── Stage 5：风险评估 ──────────────────────────────────
-        risks, events = await _stream_stage5_risk(req, requirement, scored, loop)
-        for ev in events:
-            yield ev
-
         # ── Stage 6：报告生成 + 完成 ───────────────────────────
-        events, report = await _stream_stage6_report(req, requirement, scored, evidence, risks, t_start, loop)
+        _model_ver = get_active_model()
+        events, report = await _stream_stage6_report(req, requirement, scored, evidence, risks, t_start, loop, dual_model_enabled=dual_model_enabled)
+        # P2-7: bind model version and timestamp for reproducibility
+        try:
+            import datetime as _dt
+            report.model_version = _model_ver
+            report.generated_at = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            pass
         for ev in events:
             yield ev
 
-        # ── B4：将结果存入语义缓存 ────────────────────────────
+        # ── B4：写入版本化、结构化选型缓存 ─────────────────────────────
         try:
-            from .semantic_cache import get_semantic_cache
-            get_semantic_cache().set(req.user_input, report.dict())
+            from .semantic_cache import get_semantic_cache, canonical_constraint_fingerprint
+            _report_dict = report.dict()
+            _fingerprint = canonical_constraint_fingerprint(report.constraints)
+            if _fingerprint:
+                get_semantic_cache().set_exact(_fingerprint, _report_dict)
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning(f"语义缓存写入失败: {e}")
@@ -850,7 +1656,10 @@ async def _stream_analyze(req: AnalyzeRequest) -> AsyncGenerator[str, None]:
 
 
 @app.post("/analyze/stream")
-async def analyze_stream_endpoint(body: AnalyzeRequest):
+async def analyze_stream_endpoint(
+    body: AnalyzeRequest,
+    current_user=Depends(get_current_user),
+):
     """流式输出端点：SSE 逐段推送选型报告
 
     ── B4：语义缓存支持 ──
@@ -867,16 +1676,12 @@ async def analyze_stream_endpoint(body: AnalyzeRequest):
     - text_delta: 报告文本片段（多次）
     - done: 完成 + 总耗时 + 完整报告
     """
-    # ── B4：检查语义缓存 ──────────────────────────────────────
-    from .semantic_cache import get_semantic_cache
-    cache = get_semantic_cache()
-    cache_result = cache.get(body.user_input)
-
-    # 根据缓存状态设置响应头
-    cache_header = "HIT" if cache_result is not None else "MISS"
+    # The generator emits the authoritative cache_hit event after parsing the
+    # structured requirement. A raw-text header would be misleading.
+    cache_header = "DEFERRED"
 
     return StreamingResponse(
-        _stream_analyze(body),
+        _stream_analyze(body, dual_model_enabled=bool(getattr(current_user, 'dual_model_enabled', False))),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -918,10 +1723,86 @@ async def get_schematic(topology: str, Vin: float, Vout: float, Iout: float):
         )
 
 
+# ── 器件选择端点 ────────────────────────────────────────────────
+
+class SelectPartRequest(BaseModel):
+    session_id: str = _DEFAULT_SESSION_ID
+    part_number: str
+
+@app.post("/select-part")
+async def select_part_endpoint(body: SelectPartRequest, current_user=Depends(get_current_user)):
+    """用户选择具体器件后，记录选定器件并生成其专属报告。"""
+    report = _session_reports.get(body.session_id)
+    if not report:
+        return JSONResponse(status_code=404, content={"detail": "未找到该会话的选型报告"})
+
+    # 验证器件是否在候选列表中
+    candidate_parts = _report_parts(report)
+    all_part_numbers = [_part_number(sp) for sp in candidate_parts]
+    if body.part_number not in all_part_numbers:
+        return JSONResponse(status_code=400, content={"detail": f"器件 {body.part_number} 不在本次选型结果中"})
+
+    _session_selected_part[body.session_id] = body.part_number
+    return {"status": "ok", "part_number": body.part_number}
+
+
+class InterpretSelectionRequest(BaseModel):
+    session_id: str = _DEFAULT_SESSION_ID
+    user_input: str
+
+@app.post("/interpret-selection")
+async def interpret_selection_endpoint(body: InterpretSelectionRequest, current_user=Depends(get_current_user)):
+    """用 LLM 理解用户输入是否在选取器件，若是则返回对应型号。"""
+    report = _session_reports.get(body.session_id)
+    if not report:
+        return {"selected": None}
+
+    # 收集候选器件列表
+    candidate_parts = _report_parts(report)
+    all_parts = []
+    for sp in candidate_parts:
+        pn = _part_number(sp)
+        if isinstance(sp, dict):
+            part = sp.get("part") or {}
+            mfr = part.get("manufacturer", "") if isinstance(part, dict) else ""
+            score_data = sp.get("score") or {}
+            score = int(score_data.get("total_score", 0)) if isinstance(score_data, dict) else 0
+        else:
+            mfr = getattr(getattr(sp, "part", None), "manufacturer", "") or ""
+            score = int(getattr(getattr(sp, "score", None), "total_score", 0) or 0)
+        level = sp.get("recommendation_level", "") if isinstance(sp, dict) else getattr(sp, "recommendation_level", "")
+        all_parts.append(f"{pn} ({mfr}, 评分{score}, {level})")
+
+    if not all_parts:
+        return {"selected": None}
+
+    part_list_str = "\n".join(f"{i+1}. {p}" for i, p in enumerate(all_parts))
+    prompt = (
+        f"用户输入：{body.user_input}\n\n"
+        f"候选器件列表：\n{part_list_str}\n\n"
+        "请判断用户是否在从上述列表中选择某个器件。如果是，只返回该器件的型号（MPN），不要其他内容。如果用户不是在选择器件（例如在提问、调整需求、闲聊等），只返回 null。"
+    )
+
+    try:
+        from .llm_client import call_openai_chat_text
+        result = call_openai_chat_text(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+        )
+        result = result.strip().strip('"\'`')
+        # 检查是否在列表中
+        all_pns = {_part_number(sp) for sp in candidate_parts}
+        if result in all_pns:
+            return {"selected": result}
+    except Exception:
+        pass
+    return {"selected": None}
+
+
 # ── 三类报告 Markdown 端点 ───────────────────────────────────────
 
 @app.get("/report/{report_type}")
-async def get_report(report_type: str, session_id: Optional[str] = None):
+async def get_report(report_type: str, session_id: Optional[str] = None, current_user=Depends(get_current_user)):
     """返回指定会话的三类报告 Markdown 内容。
 
     Args:
@@ -932,6 +1813,10 @@ async def get_report(report_type: str, session_id: Optional[str] = None):
         {"content": "Markdown文本", "type": "bom|risk|topology"}
     """
     sid = session_id or _DEFAULT_SESSION_ID
+    selected_pn = _session_selected_part.get(sid)
+    if not selected_pn:
+        return JSONResponse(status_code=400, content={"detail": "请先选择具体器件（回复编号如 1、2 等）后再查看报告"})
+
     _latest_report = _session_reports.get(sid)
     _latest_constraints = _session_constraints.get(sid)
     if _latest_report is None:
@@ -941,21 +1826,37 @@ async def get_report(report_type: str, session_id: Optional[str] = None):
         from .output_generator import generate_all_reports
         from .output_bom import generate_bom
         from .output_generator import generate_risk_report, generate_topology
-        import tempfile, os as _os
+        import copy
+
+        # 构建仅含选定器件的报告副本
+        filtered_report = copy.deepcopy(_latest_report)
+        filtered_report.recommended_parts = [
+            sp for sp in filtered_report.recommended_parts
+            if sp.part.part_number == selected_pn
+        ]
+        filtered_report.candidates = [
+            sp for sp in filtered_report.candidates
+            if sp.part.part_number == selected_pn
+        ]
+        if filtered_report.evidence:
+            filtered_report.evidence = [
+                e for e in filtered_report.evidence
+                if e.part_number == selected_pn
+            ]
 
         rag_context = ""
         try:
             from .output_generator import _extract_rag_context
-            rag_context = _extract_rag_context(_latest_report)
+            rag_context = _extract_rag_context(filtered_report)
         except Exception:
             pass
 
         if report_type == "bom":
-            md = generate_bom(_latest_report, rag_context=rag_context)
+            md = generate_bom(filtered_report, rag_context=rag_context)
         elif report_type == "risk":
-            md = generate_risk_report(_latest_report, _latest_constraints, rag_context=rag_context)
+            md = generate_risk_report(filtered_report, _latest_constraints, rag_context=rag_context)
         elif report_type == "topology":
-            md = generate_topology(_latest_constraints, _latest_report, rag_context=rag_context)
+            md = generate_topology(_latest_constraints, filtered_report, rag_context=rag_context)
         else:
             return JSONResponse(status_code=400, content={"detail": f"未知报告类型: {report_type}，支持 bom/risk/topology"})
 
@@ -969,7 +1870,7 @@ async def get_report(report_type: str, session_id: Optional[str] = None):
 ALLOWED_EXTENSIONS = {".pdf", ".csv", ".txt", ".md", ".json", ".xlsx", ".xls"}
 
 @app.post("/upload/parse")
-async def upload_and_parse(file: UploadFile = File(...)):
+async def upload_and_parse(file: UploadFile = File(...), current_user=Depends(get_current_user)):
     """上传文件并提取文本内容（供 LLM 解析）。
 
     支持: PDF (数据手册), CSV (BOM表), TXT/MD, JSON, Excel
@@ -1032,10 +1933,125 @@ async def upload_and_parse(file: UploadFile = File(...)):
         return JSONResponse(status_code=500, content={"detail": f"文件解析错误: {str(e)}"})
 
 
+# ── BOM 健康度诊断端点（B5）──────────────────────────────────────
+
+@app.post("/bom/validate")
+async def bom_validate_endpoint(
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user),
+):
+    """上传现有 BOM (CSV/Excel) → eZ-PLM 逐条验证 → 生命周期 + 替代料报告。"""
+    if not file.filename:
+        return JSONResponse(status_code=400, content={"detail": "未提供文件"})
+    content_bytes = await file.read()
+    ext = file.filename.lower().rsplit(".", 1)[-1] if "." in file.filename else ""
+
+    mpns: list = []
+    try:
+        if ext == "csv":
+            import csv as _csv, io as _io
+            text = content_bytes.decode("utf-8", errors="replace")
+            reader = _csv.DictReader(_io.StringIO(text))
+            mpn_col = None
+            for row in reader:
+                if mpn_col is None:
+                    _MPN_HEADERS = {"mpn", "part number", "partnumber", "型号", "物料号", "料号", "part no.", "part no", "mfr pn", "mfr part"}
+                    mpn_col = next((k for k in row if k.strip().lower() in _MPN_HEADERS), list(row.keys())[0] if row else None)
+                val = (row.get(mpn_col) or "").strip()
+                if val:
+                    mpns.append(val)
+        elif ext in ("xlsx", "xls"):
+            import io as _io, openpyxl as _xl
+            wb = _xl.load_workbook(_io.BytesIO(content_bytes), read_only=True)
+            ws = wb.active
+            rows_iter = ws.iter_rows(values_only=True)
+            header_row = next(rows_iter, None)
+            if header_row is None:
+                return JSONResponse(status_code=400, content={"detail": "Excel 文件为空"})
+            hdr = [str(h).strip().lower() if h else "" for h in header_row]
+            _MPN_HEADERS = {"mpn", "part number", "partnumber", "型号", "物料号", "料号", "part no.", "part no"}
+            col_idx = next((i for i, h in enumerate(hdr) if h in _MPN_HEADERS), 0)
+            for row in rows_iter:
+                if row and col_idx < len(row) and row[col_idx] and str(row[col_idx]).strip():
+                    mpns.append(str(row[col_idx]).strip())
+        else:
+            return JSONResponse(status_code=400, content={"detail": "仅支持 CSV / Excel (.xlsx/.xls) 格式"})
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"detail": f"文件解析失败: {str(e)}"})
+
+    mpns = list(dict.fromkeys(mpns))[:100]  # 去重 + 限制 100 条
+    if not mpns:
+        return JSONResponse(status_code=400, content={"detail": "未能提取 MPN 列表，请确认列头包含 MPN / 型号 / Part Number 等"})
+
+    from .ezplm_client import search_part_by_mpn as _mpn_q, find_replacements as _find_alt
+    from .output_bom import _lifecycle_normalized, _lifecycle_cn
+    import asyncio as _aio
+
+    loop = _aio.get_running_loop()
+    results, issues = [], []
+    summary = {"active": 0, "nrnd": 0, "eol_obsolete": 0, "unknown": 0, "not_found": 0, "domestic_count": 0}
+
+    for mpn in mpns:
+        part = await loop.run_in_executor(None, _mpn_q, mpn)
+        if not part:
+            summary["not_found"] += 1
+            issues.append({"mpn": mpn, "found": False, "lifecycle_status": "Unknown",
+                           "risk_level": "LOW", "message": f"{mpn} 在 eZ-PLM 中未找到", "alternatives": []})
+            continue
+
+        lc_raw = _lifecycle_normalized(part.lifecycle_status)
+        if lc_raw == "Active":
+            summary["active"] += 1
+        elif lc_raw == "NRND":
+            summary["nrnd"] += 1
+        elif lc_raw in ("EOL", "Obsolete", "LTB"):
+            summary["eol_obsolete"] += 1
+        else:
+            summary["unknown"] += 1
+        if getattr(part, "is_domestic", False):
+            summary["domestic_count"] += 1
+
+        alternatives, risk_level = [], "LOW"
+        if lc_raw in ("EOL", "Obsolete"):
+            risk_level = "HIGH"
+            try:
+                alts = await loop.run_in_executor(None, _find_alt, mpn)
+                alternatives = [a.part_number for a in (alts or [])[:3]]
+            except Exception:
+                pass
+        elif lc_raw in ("NRND", "LTB"):
+            risk_level = "MEDIUM"
+
+        item = {
+            "mpn": mpn, "found": True,
+            "manufacturer": part.manufacturer or "",
+            "lifecycle_status": lc_raw,
+            "lifecycle_cn": _lifecycle_cn(part.lifecycle_status),
+            "risk_level": risk_level,
+            "is_domestic": getattr(part, "is_domestic", False),
+            "package": part.package or "",
+            "alternatives": alternatives,
+        }
+        results.append(item)
+        if risk_level != "LOW":
+            issues.append(item)
+
+    total = len(mpns)
+    return {
+        "total": total,
+        "checked": len(results),
+        "issues_count": len(issues),
+        "issues": issues,
+        "all_results": results,
+        "summary": {**summary, "domestic_ratio": round(summary["domestic_count"] / total, 3) if total else 0},
+        "health_score": round(summary["active"] / total * 100, 1) if total else 0,
+    }
+
+
 # ── BOM Excel 导出端点（B6）────────────────────────────────────
 
 @app.post("/export/bom")
-async def export_bom_endpoint(session_id: Optional[str] = None):
+async def export_bom_endpoint(session_id: Optional[str] = None, current_user=Depends(get_current_user)):
     """导出工程级 BOM Excel 文件（三 Sheet）。
 
     Args:
@@ -1061,3 +2077,144 @@ async def export_bom_endpoint(session_id: Optional[str] = None):
         )
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": f"Excel 生成错误: {str(e)}"})
+
+
+@app.post("/export/decision-package")
+async def export_decision_package_endpoint(session_id: Optional[str] = None, current_user=Depends(get_current_user)):
+    """导出选型决策包（IEC/IATF 格式，含国产化分析，7 Sheet Excel）。"""
+    sid = session_id or _DEFAULT_SESSION_ID
+    report = _session_reports.get(sid)
+    if report is None:
+        return JSONResponse(status_code=404, content={"detail": "暂无分析报告，请先执行一次选型分析"})
+    try:
+        from .output_decision_package import generate_decision_package
+        xlsx = generate_decision_package(report)
+        rid = getattr(report, 'request_id', 'pkg')[:8]
+        return Response(
+            content=xlsx,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename=DecisionPackage_{rid}.xlsx"},
+        )
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": f"生成错误: {str(e)}"})
+
+
+# ── 评分维度重算（支持用户开关评分因素）────────────────────
+DIMENSION_MAP = {
+    "parameter_match": "parameter_match_score",
+    "supply_risk": "supply_risk_score",
+    "cost": "cost_score",
+    "domestic": "domestic_score",
+    "evidence": "evidence_score",
+}
+
+DIMENSION_LABELS = {
+    "parameter_match": "参数匹配度",
+    "supply_risk": "供应链风险",
+    "cost": "成本",
+    "domestic": "国产化",
+    "evidence": "证据可信度",
+}
+
+class RecalculateRequest(BaseModel):
+    session_id: str = _DEFAULT_SESSION_ID
+    dimensions: list[str] = list(DIMENSION_MAP.keys())  # 用户启用的维度列表
+
+@app.post("/recalculate")
+async def recalculate_endpoint(body: RecalculateRequest, current_user=Depends(get_current_user)):
+    """根据用户启用的评分维度重新计算推荐分数。"""
+    report = _session_reports.get(body.session_id)
+    if not report:
+        return JSONResponse(status_code=404, content={"detail": "未找到该会话的报告"})
+
+    if not body.dimensions:
+        return JSONResponse(status_code=400, content={"detail": "至少需要一个评分维度"})
+
+    # 校验所有维度名称
+    for d in body.dimensions:
+        if d not in DIMENSION_MAP:
+            return JSONResponse(status_code=400, content={"detail": f"未知维度: {d}"})
+
+    updated_parts = []
+    for sp in _report_parts(report):
+        score = sp.score
+        vals = []
+        for d in body.dimensions:
+            v = getattr(score, DIMENSION_MAP[d], None)
+            if v is not None:
+                vals.append(v)
+        # 重算 total_score：启用维度的均值
+        new_total = round(sum(vals) / len(vals), 2) if vals else 0.0
+        updated_parts.append({
+            "part_number": sp.part.part_number,
+            "manufacturer": sp.part.manufacturer,
+            "scores": {d: getattr(score, DIMENSION_MAP[d], 0) for d in DIMENSION_MAP},
+            "active_dimensions": body.dimensions,
+            "total_score": new_total,
+        })
+
+    return {
+        "parts": sorted(updated_parts, key=lambda x: x["total_score"], reverse=True),
+        "active_dimensions": body.dimensions,
+    }
+
+
+# ── 工作流 AI 生成 ─────────────────────────────────────────────────────
+class WorkflowGenerateRequest(BaseModel):
+    description: str
+
+_WORKFLOW_ICONS = ["Brain", "Search", "MessageSquare", "FileText", "BarChart2",
+                   "CheckCircle", "Filter", "Cpu", "Zap", "Shield", "GitMerge",
+                   "Radio", "AlertTriangle"]
+_WORKFLOW_COLORS = ["bg-violet-100 text-violet-700", "bg-teal-100 text-teal-700",
+                    "bg-blue-100 text-blue-700", "bg-amber-100 text-amber-700",
+                    "bg-rose-100 text-rose-700", "bg-emerald-100 text-emerald-700"]
+
+_WORKFLOW_SYSTEM = """你是一个工作流设计专家。根据用户对业务流程的自然语言描述，生成一个有向工作流图。
+
+要求：
+1. 返回纯 JSON，不含 markdown 代码块。
+2. JSON 结构：{"name": "...", "nodes": [...], "edges": [...]}
+3. 每个 node 字段：id(字符串), iconName(从列表选), label(节点名≤8字), color(从列表选), description(≤20字), x(数字), y(数字)
+4. iconName 只能从以下选择：Brain Search MessageSquare FileText BarChart2 CheckCircle Filter Cpu Zap Shield GitMerge Radio AlertTriangle
+5. color 只能从以下选择：bg-violet-100 text-violet-700 / bg-teal-100 text-teal-700 / bg-blue-100 text-blue-700 / bg-amber-100 text-amber-700 / bg-rose-100 text-rose-700 / bg-emerald-100 text-emerald-700
+6. 节点 x/y 坐标：从左到右或从上到下布局，x 步长约 220，y 步长约 120，起点 (80, 80)
+7. 每个 edge 字段：source(节点id), target(节点id)
+8. 节点数量 4-10 个，确保逻辑连贯、覆盖描述中的关键步骤"""
+
+@app.post("/workflow/generate")
+async def workflow_generate(body: WorkflowGenerateRequest, current_user=Depends(get_current_user)):
+    from .llm_client import call_openai_chat
+    import json as _json
+
+    messages = [
+        {"role": "system", "content": _WORKFLOW_SYSTEM},
+        {"role": "user", "content": f"请根据以下业务流程描述，设计工作流图：\n\n{body.description}"},
+    ]
+    try:
+        result = call_openai_chat(messages, temperature=0.3, thinking_depth="off")
+        raw = result.get("content", "")
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("```", 2)[1]
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:]
+        data = _json.loads(cleaned.strip())
+        return data
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": f"AI 生成失败: {str(e)}"})
+
+
+# ── 前端静态文件托管（单端口部署模式）─────────────────────
+import os as _os
+_static_dir = _os.path.join(_os.path.dirname(__file__), "static")
+if _os.path.exists(_static_dir):
+    from fastapi.staticfiles import StaticFiles
+    from fastapi.responses import HTMLResponse
+    app.mount("/", StaticFiles(directory=_static_dir, html=True), name="static")
+
+    @app.get("/setup", response_class=HTMLResponse)
+    async def setup_page():
+        """Onboarding 配置向导（代理到首页，前端 SPA 处理路由）。"""
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url="/")
